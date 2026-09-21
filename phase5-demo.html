@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phase 5 Demo — Real Tracktion Engine MIDI</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0a0a; color: #e4e4e7;
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 24px; min-height: 100vh;
+    }
+    .container { max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 28px; font-weight: 600; margin-bottom: 8px; }
+    .subtitle { color: #a1a1aa; margin-bottom: 24px; }
+    .subtitle code, .api code, .logs code, .step code { color: #a78bfa; font-family: monospace; font-size: 13px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+    .card { background: #18181b; padding: 16px; border-radius: 8px; border: 1px solid #27272a; }
+    .card h2 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #a1a1aa; text-transform: uppercase; letter-spacing: 0.05em; }
+    .status-row { font-size: 13px; line-height: 1.8; }
+    .status-row .label { color: #71717a; display: inline-block; min-width: 90px; }
+    .logs-box {
+      font-size: 11px; line-height: 1.5; font-family: monospace;
+      color: #71717a; max-height: 120px; overflow-y: auto;
+      background: #0a0a0a; padding: 8px; border-radius: 4px;
+    }
+    .step { background: #18181b; padding: 24px; border-radius: 8px; border: 1px solid #27272a; margin-bottom: 24px; }
+    .step h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #e4e4e7; }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    button {
+      padding: 10px 20px; color: #fff; border: none; border-radius: 6px;
+      cursor: pointer; font-size: 14px; font-weight: 500; transition: opacity 0.2s;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
+    .btn-primary { background: #7c3aed; }
+    .btn-primary:not(:disabled):hover { background: #6d28d9; }
+    .btn-info { background: #0891b2; }
+    .btn-info:not(:disabled):hover { background: #0e7490; }
+    .btn-play { background: #16a34a; }
+    .btn-play:not(:disabled):hover { background: #15803d; }
+    .btn-stop { background: #dc2626; }
+    .btn-stop:not(:disabled):hover { background: #b91c1c; }
+    .hint { font-size: 12px; color: #71717a; margin-top: 8px; }
+    .keyboard { display: flex; gap: 4px; flex-wrap: wrap; }
+    .key {
+      padding: 20px 16px; background: #27272a; color: #fff;
+      border: 1px solid #3f3f46; border-radius: 6px; cursor: pointer;
+      font-size: 14px; font-weight: 500; min-width: 60px;
+      user-select: none; transition: background 0.1s;
+    }
+    .key:hover { background: #3f3f46; }
+    .key.active { background: #7c3aed; border-color: #7c3aed; }
+    .bpm-row { margin-top: 12px; }
+    .bpm-row label { font-size: 13px; color: #a1a1aa; display: block; margin-bottom: 4px; }
+    input[type="range"] { width: 100%; }
+    .error {
+      background: #7f1d1d; color: #fecaca; padding: 12px 16px;
+      border-radius: 6px; margin-bottom: 16px; font-family: monospace; font-size: 13px;
+    }
+    .api-list { font-size: 13px; line-height: 1.8; color: #a1a1aa; padding-left: 20px; }
+    .api-list li { margin-bottom: 4px; }
+    .position-bar {
+      height: 4px; background: #27272a; border-radius: 2px; margin-top: 8px; overflow: hidden;
+    }
+    .position-fill {
+      height: 100%; background: #7c3aed; width: 0%; transition: width 0.1s;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎹 Phase 5 Demo — Real Tracktion Engine MIDI</h1>
+    <p class="subtitle">
+      Demonstrates the Phase 5 P1-1 fix: <code>engine_transport_play()</code> works in WASM.
+      Real transport + MIDI sequencing via AudioWorklet. No demo buffer mode.
+    </p>
+
+    <div id="error-box" style="display:none;" class="error"></div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Status</h2>
+        <div class="status-row">
+          <div><span class="label">Audio:</span> <span id="audio-status">⚪ stopped</span></div>
+          <div><span class="label">Engine:</span> <span id="engine-status">⚪ not created</span></div>
+          <div><span class="label">Synth:</span> <span id="synth-status">⚪ —</span></div>
+          <div><span class="label">Engine audio:</span> <span id="engineaudio-status">⚪ inactive</span></div>
+          <div><span class="label">Playing:</span> <span id="playing-status">⚪ no</span></div>
+          <div><span class="label">Position:</span> <span id="position-status">0.00s</span></div>
+          <div><span class="label">BPM:</span> <span id="bpm-status">120</span></div>
+          <div><span class="label">Melody:</span> <span id="melody-status">⚪ not loaded</span></div>
+          <div><span class="label">RMS:</span> <span id="rms-status">0.0000 (0 audio blocks)</span></div>
+        </div>
+        <div class="position-bar"><div id="position-fill" class="position-fill"></div></div>
+      </div>
+      <div class="card">
+        <h2>Activity Log</h2>
+        <div id="logs" class="logs-box">(no activity yet)</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <h2>Step 1: Start Audio</h2>
+      <div class="btn-row">
+        <button id="btn-start" class="btn-primary" onclick="startAudio()">Start Audio</button>
+      </div>
+      <p class="hint">
+        Creates AudioContext (48kHz), loads <code>phase5-processor.js</code> AudioWorklet,
+        instantiates the real Tracktion Engine in the worklet.
+      </p>
+    </div>
+
+    <div class="step">
+      <h2>Step 2: Load Melody + Play</h2>
+      <div class="btn-row">
+        <button id="btn-load" class="btn-info" onclick="loadMelody()" disabled>Load MIDI clip + melody</button>
+        <button id="btn-play" class="btn-play" onclick="play()" disabled>▶ Play</button>
+        <button id="btn-stop" class="btn-stop" onclick="stop()" disabled>⏹ Stop</button>
+      </div>
+      <div class="bpm-row">
+        <label>BPM: <span id="bpm-display">120</span></label>
+        <input type="range" id="bpm-slider" min="60" max="200" value="120" oninput="changeBpm(this.value)">
+      </div>
+      <p class="hint">
+        Melody: C4 E4 G4 C5 G4 E4 C4 (1 beat each, last = 2 beats). Real transport plays via <code>engine_transport_play()</code>.
+      </p>
+    </div>
+
+    <div class="step">
+      <h2>Step 3: Live MIDI Keyboard</h2>
+      <p class="hint" style="margin-bottom: 12px;">
+        Click keys to send live <code>engine_note_on()</code> / <code>engine_note_off()</code> messages.
+      </p>
+      <div id="keyboard" class="keyboard"></div>
+    </div>
+
+    <div class="step">
+      <h2>What this proves</h2>
+      <ul class="api-list">
+        <li><code>engine_create()</code> instantiates the real Tracktion Engine (375K LOC C++) in WASM</li>
+        <li><code>engine_transport_play()</code> works — was the Phase 5 P1-1 blocker (fixed in R4)</li>
+        <li><code>engine_add_midi_clip()</code> + <code>engine_add_midi_note()</code> schedule MIDI on the real transport</li>
+        <li><code>engine_note_on()</code> + <code>engine_note_off()</code> send live MIDI to the engine</li>
+        <li>Audio output via AudioWorklet calling <code>engine_process_block()</code></li>
+        <li>P1-1 fix: 3 patches — <code>yup_SystemStats_wasm.cpp</code> numCpus=1, <code>yup_Threads_wasm.cpp</code> Thread stub, <code>WasmEngineBehaviour</code> override</li>
+      </ul>
+    </div>
+  </div>
+
+  <script type="module">
+    // === State ===
+    let audioCtx = null;
+    let workletNode = null;
+    let audioRunning = false;
+    let engineCreated = false;
+    let isPlaying = false;
+    let melodyLoaded = false;
+    let bpm = 120;
+    let activeNote = null;
+
+    const MELODY = [
+      { pitch: 60, vel: 100, start: 0,   len: 0.5 },   // C4
+      { pitch: 64, vel: 100, start: 0.5, len: 0.5 },  // E4
+      { pitch: 67, vel: 100, start: 1.0, len: 0.5 },  // G4
+      { pitch: 72, vel: 100, start: 1.5, len: 0.5 },  // C5
+      { pitch: 67, vel: 90,  start: 2.0, len: 0.5 },  // G4
+      { pitch: 64, vel: 90,  start: 2.5, len: 0.5 },  // E4
+      { pitch: 60, vel: 90,  start: 3.0, len: 1.0 },  // C4 (longer)
+    ];
+
+    const KEYBOARD = [
+      { name: 'C4', note: 60 }, { name: 'D4', note: 62 }, { name: 'E4', note: 64 },
+      { name: 'F4', note: 65 }, { name: 'G4', note: 67 }, { name: 'A4', note: 69 },
+      { name: 'B4', note: 71 }, { name: 'C5', note: 72 },
+    ];
+
+    // === Helpers ===
+    function log(msg) {
+      const ts = new Date().toLocaleTimeString();
+      const box = document.getElementById('logs');
+      const lines = box.textContent.split('\n').filter(l => l.trim());
+      lines.push(`[${ts}] ${msg}`);
+      box.textContent = lines.slice(-9).join('\n');
+    }
+
+    function setError(msg) {
+      const box = document.getElementById('error-box');
+      if (msg) { box.textContent = '⚠️ ' + msg; box.style.display = 'block'; }
+      else { box.style.display = 'none'; }
+    }
+
+    function updateUI() {
+      document.getElementById('audio-status').textContent = audioRunning ? '🟢 running' : '⚪ stopped';
+      document.getElementById('engine-status').textContent = engineCreated ? '🟢 created' : '⚪ not created';
+      document.getElementById('playing-status').textContent = isPlaying ? '🔴 yes' : '⚪ no';
+      document.getElementById('melody-status').textContent = melodyLoaded ? '🟢 loaded' : '⚪ not loaded';
+      document.getElementById('bpm-status').textContent = bpm;
+      document.getElementById('bpm-display').textContent = bpm;
+
+      const btnStart = document.getElementById('btn-start');
+      btnStart.textContent = audioRunning ? '✓ Audio running' : 'Start Audio';
+      btnStart.disabled = audioRunning;
+
+      document.getElementById('btn-load').disabled = !engineCreated || melodyLoaded;
+      document.getElementById('btn-load').textContent = melodyLoaded ? '✓ Melody loaded' : 'Load MIDI clip + melody';
+      document.getElementById('btn-play').disabled = !melodyLoaded || isPlaying;
+      document.getElementById('btn-stop').disabled = !isPlaying;
+    }
+
+    function postToWorklet(msg) {
+      if (workletNode) workletNode.port.postMessage(msg);
+    }
+
+    // === Build keyboard ===
+    function buildKeyboard() {
+      const kb = document.getElementById('keyboard');
+      kb.innerHTML = '';
+      KEYBOARD.forEach(({ name, note }) => {
+        const btn = document.createElement('button');
+        btn.className = 'key';
+        btn.textContent = name;
+        btn.dataset.note = note;
+        btn.addEventListener('mousedown', () => noteOn(note, btn));
+        btn.addEventListener('mouseup', () => noteOff(note, btn));
+        btn.addEventListener('mouseleave', () => {
+          if (activeNote === note) noteOff(note, btn);
+        });
+        kb.appendChild(btn);
+      });
+    }
+
+    function noteOn(note, btn) {
+      if (!engineCreated) { log('Engine not ready — start audio first'); return; }
+      activeNote = note;
+      btn.classList.add('active');
+      postToWorklet({ type: 'note-on', note, velocity: 100 });
+    }
+
+    function noteOff(note, btn) {
+      activeNote = null;
+      btn.classList.remove('active');
+      postToWorklet({ type: 'note-off', note });
+    }
+
+    // === Audio startup ===
+    window.startAudio = async function() {
+      if (audioRunning) return;
+      try {
+        setError(null);
+        log('Creating AudioContext...');
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: 48000 });
+
+        log('Adding AudioWorklet module...');
+        await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+        log('AudioWorklet loaded');
+
+        workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+        });
+        workletNode.connect(audioCtx.destination);
+
+        workletNode.port.onmessage = (e) => {
+          const msg = e.data;
+          if (msg.type === 'ready') {
+            engineCreated = msg.engineCreated === true;
+            document.getElementById('synth-status').textContent = msg.synth ? '🟢 FourOsc active' : '⚪ —';
+            document.getElementById('engineaudio-status').textContent = msg.engineAudio ? '🟢 active' : '⚪ inactive';
+            log(`Engine ready (engineCreated=${engineCreated})`);
+            if (engineCreated) {
+              postToWorklet({ type: 'set-bpm', bpm });
+            }
+            updateUI();
+          } else if (msg.type === 'position') {
+            document.getElementById('position-status').textContent = msg.position.toFixed(2) + 's';
+            isPlaying = msg.isPlaying === true || msg.isPlaying === 1;
+            document.getElementById('rms-status').textContent =
+              (msg.rms ?? 0).toFixed(4) + ' (' + (msg.engineAudioBlocks ?? 0) + ' audio blocks)';
+            // Position bar (4 beats = 2 seconds at 120 BPM)
+            const pct = Math.min(100, (msg.position / 2.0) * 100);
+            document.getElementById('position-fill').style.width = pct + '%';
+            updateUI();
+          } else if (msg.type === 'error') {
+            setError(msg.error);
+            log(`Error: ${msg.error}`);
+          }
+        };
+
+        log('Fetching WASM binary...');
+        const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm');
+        const wasmBinary = await wasmResp.arrayBuffer();
+        log(`WASM fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+        workletNode.port.postMessage({ type: 'init-wasm', wasmBinary }, [wasmBinary]);
+
+        audioRunning = true;
+        log('Audio running — engine initializing in worklet');
+        updateUI();
+
+        // Periodic pump between quanta (the worklet's realtime mode disables
+        // the in-block timer pump; the PAGE drives it here — this is what
+        // keeps deferred engine work flowing during playback, e.g. the
+        // transport position updates. Mirrors the phase8 page + the
+        // worklet's initWasm note.)
+        setInterval(() => { postToWorklet({ type: 'pump' }); }, 100);
+      } catch (e) {
+        setError(e.message);
+        log(`Error: ${e.message}`);
+      }
+    };
+
+    window.loadMelody = function() {
+      if (!engineCreated) { log('Engine not ready — start audio first'); return; }
+      log('Adding MIDI clip (startBeat=0, lengthBeats=4)...');
+      postToWorklet({ type: 'add-midi-clip', startBeat: 0, lengthBeats: 4 });
+      MELODY.forEach((note) => {
+        postToWorklet({
+          type: 'add-midi-note',
+          pitch: note.pitch, velocity: note.vel,
+          startBeat: note.start, lengthBeats: note.len,
+        });
+      });
+      melodyLoaded = true;
+      log(`Loaded ${MELODY.length} notes (C4 E4 G4 C5 G4 E4 C4)`);
+      updateUI();
+    };
+
+    window.play = function() {
+      if (!melodyLoaded) { log('Load melody first'); return; }
+      postToWorklet({ type: 'transport-play' });
+      log('transport_play() — real transport started');
+      document.getElementById('position-fill').style.width = '0%';
+    };
+
+    window.stop = function() {
+      postToWorklet({ type: 'transport-stop' });
+      log('transport_stop()');
+    };
+
+    window.changeBpm = function(val) {
+      bpm = parseInt(val);
+      postToWorklet({ type: 'set-bpm', bpm });
+      updateUI();
+      log(`BPM set to ${bpm}`);
+    };
+
+    // === Init ===
+    buildKeyboard();
+    updateUI();
+    log('Demo ready — click "Start Audio" to begin');
+  </script>
+</body>
+</html>

@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase E2e — automation + folder tracks (browser demo)</title>
+<style>
+  body { font-family: monospace; margin: 16px; max-width: 900px; }
+  button { margin: 4px 4px 4px 0; padding: 6px 12px; font-size: 12px;
+           font-family: inherit; }
+  .sub { color: #666; font-size: 12px; max-width: 800px; }
+  #status { font-weight: bold; margin: 8px 0; }
+  #log { white-space: pre-wrap; font-size: 11px; max-height: 300px;
+         overflow-y: auto; background: #f4f4f4; padding: 8px; }
+  h2 { font-size: 14px; margin: 18px 0 4px 0; border-bottom: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h1>Phase E2e — automation + folder tracks + moveTo + the rebuild counters</h1>
+<p class="sub">The E2c/E2d scaffolding + the E2e panels: the automation
+curve (add/read/clear/bypass points on the EQ's low-shelf gain — LIVE,
+pump-delivered), the folder submix (insert + children + the fader/mute),
+the cross-track clip move, and the P2-2 rebuild-counter instrument (the
+G-H divergence scenario). Requires the E2e wasm build.</p>
+<button id="start">start audio + engine + register + insert + EQ</button>
+<button id="play">play</button>
+<button id="stop">stop</button>
+<h2>Automation (the curve drives "Low-pass gain", corner 8000)</h2>
+<button id="au-corner">set shelf corner 8000</button>
+<button id="au-add2">add ramp points (0.2 → 0dB, 1.0 → -20dB)</button>
+<button id="au-read">read points back</button>
+<button id="au-clear">clear curve</button>
+<button id="au-bypass">toggle bypass</button>
+<button id="au-1point">the G-C 1-point follow setup</button>
+<h2>Folder submix</h2>
+<button id="f-insert">insert folder</button>
+<button id="f-children">add 2 children (clips)</button>
+<button id="f-fader">folder fader -6 dB</button>
+<button id="f-flat">folder fader 0 dB</button>
+<button id="f-mute">toggle folder mute</button>
+<button id="f-read">read folder map</button>
+<h2>moveTo + counters</h2>
+<button id="c-move">move the main clip → child 1</button>
+<button id="c-counters">read the rebuild counters</button>
+<button id="gh-run">G-H: the divergence scenario</button>
+<div id="status">idle</div>
+<div id="log"></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000;
+const E2E = {
+  freq: 440.0, amp: 0.5, frames: 96000, framesLong: 192000, nameLong: 'e2e-long',
+  start: 0.0, len: 2.0, name: 'e2c', track: 1,
+  loGain: 'Low-pass gain', loFreq: 'Low-pass freq', corner: 8000.0,
+};
+
+let audioCtx = null, workletNode = null, analyser = null;
+let engineReady = false, audioRunning = false;
+let numTracks = 1, registered = false, clipInserted = false, clipIdx = -1, itemId = 0;
+let folderId = 0, child1 = -1, child2 = -1;
+const replies = [];
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(s) { logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+function setStatus(s) { statusEl.textContent = s; }
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+function waitFor(type, ms = 6000, match = null) {
+  const pred = typeof type === 'function' ? type
+    : (r) => r.type === type && (!match || match(r));
+  const t0 = performance.now();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const idx = replies.findIndex(pred);
+      if (idx >= 0) { clearInterval(iv); resolve(replies.splice(idx, 1)[0]); }
+      else if (performance.now() - t0 > ms) { clearInterval(iv); resolve(null); }
+    }, 30);
+  });
+}
+
+function workletOnMessage(d) {
+  if (d && d.type === 'warn') log('WARN: ' + d.message);
+  if (d && (d.type === 'ready' || d.type === 'track-added' ||
+            d.type === 'audio-buffer-registered' ||
+            d.type === 'wave-clip-inserted' ||
+            d.type === 'num-wave-clips' || d.type === 'wave-clip-info' ||
+            d.type === 'clip-gain-set' || d.type === 'clip-mute-set' ||
+            d.type === 'edit-xml' ||
+            d.type === 'plugin-added' || d.type === 'plugin-param-set' ||
+            d.type === 'plugin-param' ||
+            // the E2e reply family (the collector completeness rule — a
+            // reply type MISSING here is silently DROPPED, §6e.3)
+            d.type === 'automation-num-points' || d.type === 'automation-point' ||
+            d.type === 'automation-point-added' ||
+            d.type === 'automation-point-removed' ||
+            d.type === 'automation-point-value-set' ||
+            d.type === 'automation-point-curve-set' ||
+            d.type === 'automation-cleared' || d.type === 'automation-bypass-set' ||
+            d.type === 'automation-bypass' || d.type === 'automation-param-range' ||
+            d.type === 'folder-inserted' || d.type === 'track-added-in-folder' ||
+            d.type === 'track-moved-to-folder' || d.type === 'track-item-id' ||
+            d.type === 'num-folder-tracks' || d.type === 'folder-track-id' ||
+            d.type === 'track-parent-folder' || d.type === 'folder-volume-set' ||
+            d.type === 'folder-mute-set' || d.type === 'clip-moved-to-track' ||
+            d.type === 'graph-rebuild-count' ||
+            d.type === 'rebuild-request-count' ||
+            d.type === 'rebuild-counters-reset' ||
+            // the instruments (the E2b/E2d families)
+            d.type === 'track-level' || d.type === 'master-level' ||
+            d.type === 'transport-events'))
+    replies.push(d);
+}
+
+function e2eSinePcm(freq, frames, chans, amp) {
+  const out = new Float32Array(frames * chans);
+  for (let i = 0; i < frames; i++) {
+    const v = amp * Math.sin((2 * Math.PI * freq * i) / SAMPLE_RATE);
+    out[i] = v;
+    if (chans === 2) out[frames + i] = v;
+  }
+  return out;
+}
+
+let pumpTimer = null, pumpIntervalMs = 100;
+function startPump() {
+  if (pumpTimer) clearInterval(pumpTimer);
+  pumpTimer = setInterval(() => { if (workletNode) post({ type: 'pump' }); }, pumpIntervalMs);
+}
+window.setPumpInterval = function (ms) {
+  pumpIntervalMs = Math.max(5, Number(ms) || 100);
+  startPump();
+  log('pump interval: ' + pumpIntervalMs + ' ms');
+};
+
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => workletOnMessage(e.data);
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`wasm fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    post({ type: 'init-wasm', wasmBinary, instrument: 'none', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = ready && ready.engineCreated === true;
+    audioRunning = true;
+    startPump();
+    post({ type: 'add-track', name: 'e2e-auto' });
+    const t = await waitFor('track-added');
+    numTracks = t ? t.numTracks : 1;
+    const pcm = e2eSinePcm(E2E.freq, E2E.frames, 2, E2E.amp);
+    post({ type: 'register-audio-buffer', name: E2E.name, pcm,
+           numFrames: E2E.frames, numChannels: 2, sampleRate: SAMPLE_RATE });
+    const reg = await waitFor('audio-buffer-registered');
+    // the LONG 4s asset (the G-A/G-B/G-F/G-G window headroom — the 2s clip's
+    // edit end lands inside the measurement windows; the parked-seek gates
+    // need [park, edit_end) room)
+    const pcmLong = e2eSinePcm(E2E.freq, E2E.framesLong, 2, E2E.amp);
+    post({ type: 'register-audio-buffer', name: E2E.nameLong, pcm: pcmLong,
+           numFrames: E2E.framesLong, numChannels: 2, sampleRate: SAMPLE_RATE });
+    const regLong = await waitFor('audio-buffer-registered');
+    if (!regLong || regLong.rc !== 0) { setStatus('long register FAILED rc=' + (regLong && regLong.rc)); return; }
+    if (!reg || reg.rc !== 0) { setStatus('register FAILED rc=' + (reg && reg.rc)); return; }
+    registered = true;
+    post({ type: 'insert-wave-clip', trackId: E2E.track, name: E2E.name,
+           startSec: E2E.start, lengthSec: E2E.len });
+    const ins = await waitFor('wave-clip-inserted');
+    if (!ins || ins.rc < 0) { setStatus('insert FAILED rc=' + (ins && ins.rc)); return; }
+    clipIdx = ins.clipIdx;
+    // the EQ (the E2a surface — the automation's target plugin)
+    post({ type: 'add-plugin', trackId: E2E.track, pluginType: '4bandEq' });
+    const pl = await waitFor('plugin-added');
+    if (!pl || pl.rc !== 0) { setStatus('add EQ FAILED rc=' + (pl && pl.rc)); return; }
+    clipInserted = true;
+    const info0 = await window.getClipInfo(E2E.track, clipIdx);
+    itemId = info0 ? Number(info0.itemId) : 0;
+    log('clip inserted (idx ' + clipIdx + ', itemId ' + itemId + '); EQ added');
+    setStatus(engineReady ? 'engine + clip + EQ ready (itemId ' + itemId + ')' : 'engine FAILED');
+  } catch (e) {
+    setStatus('ERROR: ' + String(e)); log('startAudio threw: ' + String(e));
+  }
+};
+
+// ---- the E2e surface entry points ----
+window.setPluginParam = async function (trackId, pluginIdx, paramId, value) {
+  post({ type: 'set-plugin-param', trackId: trackId | 0, pluginIdx: pluginIdx | 0,
+         paramId: String(paramId), value: Number(value) });
+  return await waitFor((r) => r.type === 'plugin-param-set' &&
+                              r.trackId === (trackId | 0) && r.paramId === String(paramId));
+};
+window.auGetNumPoints = async function (trackId, pluginIdx, paramId) {
+  post({ type: 'automation-get-num-points', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId) });
+  const r = await waitFor('automation-num-points');
+  return r ? r.count : null;
+};
+window.auGetPoint = async function (trackId, pluginIdx, paramId, pointIdx) {
+  post({ type: 'automation-get-point', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId), pointIdx: pointIdx | 0 });
+  const r = await waitFor('automation-point');
+  return r ? r : null;
+};
+window.auAddPoint = async function (trackId, pluginIdx, paramId, t, v, c) {
+  post({ type: 'automation-add-point', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId),
+         t: Number(t), v: Number(v), c: Number(c) });
+  const r = await waitFor('automation-point-added');
+  return r ? r.index : null;
+};
+window.auRemovePoint = async function (trackId, pluginIdx, paramId, pointIdx) {
+  post({ type: 'automation-remove-point', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId), pointIdx: pointIdx | 0 });
+  return await waitFor('automation-point-removed');
+};
+window.auSetPointValue = async function (trackId, pluginIdx, paramId, pointIdx, v) {
+  post({ type: 'automation-set-point-value', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId),
+         pointIdx: pointIdx | 0, v: Number(v) });
+  return await waitFor('automation-point-value-set');
+};
+window.auSetPointCurve = async function (trackId, pluginIdx, paramId, pointIdx, c) {
+  post({ type: 'automation-set-point-curve', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId),
+         pointIdx: pointIdx | 0, c: Number(c) });
+  return await waitFor('automation-point-curve-set');
+};
+window.auClear = async function (trackId, pluginIdx, paramId) {
+  post({ type: 'automation-clear', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId) });
+  return await waitFor('automation-cleared');
+};
+window.auSetBypass = async function (trackId, pluginIdx, paramId, bypass) {
+  post({ type: 'automation-set-bypass', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId), bypass: !!bypass });
+  return await waitFor('automation-bypass-set');
+};
+window.auGetBypass = async function (trackId, pluginIdx, paramId) {
+  post({ type: 'automation-get-bypass', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId) });
+  const r = await waitFor('automation-bypass');
+  return r ? r.value : null;
+};
+window.auGetParamRange = async function (trackId, pluginIdx, paramId) {
+  post({ type: 'automation-get-param-range', trackId: trackId | 0,
+         pluginIdx: pluginIdx | 0, paramId: String(paramId) });
+  const r = await waitFor('automation-param-range');
+  return r ? { rc: r.rc, min: r.min, max: r.max } : null;
+};
+window.insertFolder = async function (name, parentFolderId) {
+  post({ type: 'insert-folder', name: String(name || ''), parentFolderId: Number(parentFolderId) || 0 });
+  const r = await waitFor('folder-inserted');
+  return r ? r.folderId : null;
+};
+window.addTrackInFolder = async function (folderId, name) {
+  post({ type: 'add-track-in-folder', folderId: Number(folderId) || 0, name: String(name || '') });
+  const r = await waitFor('track-added-in-folder');
+  if (r && typeof r.trackId === 'number' && r.trackId >= 0)
+    numTracks = Math.max(numTracks, r.trackId + 1);
+  return r ? r.trackId : null;
+};
+window.moveTrackToFolder = async function (trackItemId, folderId) {
+  post({ type: 'move-track-to-folder', trackItemId: Number(trackItemId) || 0,
+         folderId: Number(folderId) || 0 });
+  return await waitFor('track-moved-to-folder');
+};
+window.getTrackItemId = async function (trackId) {
+  post({ type: 'get-track-item-id', trackId: trackId | 0 });
+  const r = await waitFor('track-item-id');
+  return r ? r.itemId : null;
+};
+window.numFolderTracks = async function () {
+  post({ type: 'get-num-folder-tracks' });
+  const r = await waitFor('num-folder-tracks');
+  return r ? r.count : null;
+};
+window.getFolderTrackId = async function (folderIdx) {
+  post({ type: 'get-folder-track-id', folderIdx: folderIdx | 0 });
+  const r = await waitFor('folder-track-id');
+  return r ? r.folderId : null;
+};
+window.getTrackParentFolder = async function (trackId) {
+  post({ type: 'get-track-parent-folder', trackId: trackId | 0 });
+  const r = await waitFor('track-parent-folder');
+  return r ? r.folderId : null;
+};
+window.setFolderVolumeDb = async function (folderId, db) {
+  post({ type: 'set-folder-volume-db', folderId: Number(folderId) || 0, db: Number(db) });
+  return await waitFor('folder-volume-set');
+};
+window.setFolderMute = async function (folderId, mute) {
+  post({ type: 'set-folder-mute', folderId: Number(folderId) || 0, mute: !!mute });
+  return await waitFor('folder-mute-set');
+};
+window.moveClipToTrack = async function (itemId, targetTrackId) {
+  post({ type: 'move-clip-to-track', itemId: Number(itemId) || 0,
+         targetTrackId: targetTrackId | 0 });
+  return await waitFor((r) => r.type === 'clip-moved-to-track');
+};
+window.getGraphRebuildCount = async function () {
+  post({ type: 'get-graph-rebuild-count' });
+  const r = await waitFor('graph-rebuild-count');
+  return r ? r.count : null;
+};
+window.getRebuildRequestCount = async function () {
+  post({ type: 'get-rebuild-request-count' });
+  const r = await waitFor('rebuild-request-count');
+  return r ? r.count : null;
+};
+window.resetRebuildCounters = async function () {
+  post({ type: 'reset-rebuild-counters' });
+  return await waitFor('rebuild-counters-reset');
+};
+window.getTransportEvents = async function () {
+  post({ type: 'get-transport-events' });
+  const r = await waitFor('transport-events');
+  return r ? r.count : null;
+};
+window.getTrackLevel = async function (trackId) {
+  post({ type: 'get-track-level', trackId: trackId | 0 });
+  const r = await waitFor((r) => r.type === 'track-level' && r.trackId === (trackId | 0));
+  return r ? r.levelDb : null;
+};
+window.getMasterLevel = async function () {
+  post({ type: 'get-master-level' });
+  const r = await waitFor('master-level');
+  return r ? r.levelDb : null;
+};
+
+// ---- the E2c/E2d shared surface ----
+window.getClipInfo = async function (trackId, idx) {
+  post({ type: 'get-wave-clip-info', trackId: trackId | 0, clipIdx: idx | 0 });
+  const r = await waitFor((r) => r.type === 'wave-clip-info' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+  return r ? r.info : null;
+};
+window.numClips = async function (trackId) {
+  post({ type: 'num-wave-clips', trackId: trackId | 0 });
+  const r = await waitFor((r) => r.type === 'num-wave-clips' && r.trackId === (trackId | 0));
+  return r ? r.num : null;
+};
+window.getEditXml = async function () {
+  post({ type: 'get-edit-xml' });
+  const r = await waitFor('edit-xml');
+  return r ? r.xml : null;
+};
+window.setClipGain = async function (trackId, idx, gainDb) {
+  post({ type: 'set-clip-gain', trackId: trackId | 0, clipIdx: idx | 0,
+         gainDb: Number(gainDb) });
+  return await waitFor((r) => r.type === 'clip-gain-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+window.getPluginParam = async function (trackId, pluginIdx, paramId) {
+  post({ type: 'get-plugin-param', trackId: trackId | 0, pluginIdx: pluginIdx | 0,
+         paramId: String(paramId) });
+  const r = await waitFor((r) => r.type === 'plugin-param' &&
+                                r.trackId === (trackId | 0) && r.paramId === String(paramId));
+  return r ? r.value : null;
+};
+window.play = async function () { post({ type: 'transport-play' }); };
+window.stop = async function () { post({ type: 'transport-stop' }); };
+window.seek = async function (sec) { post({ type: 'seek', seconds: sec }); };
+
+// ---- measurement taps ----
+window.tapRms = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(d);
+  let s = 0;
+  for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+  return Math.sqrt(s / d.length);
+};
+window.tapSpectrum = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(d);
+  let best = -Infinity, bi = -1;
+  for (let i = 1; i < d.length; i++) if (d[i] > best) { best = d[i]; bi = i; }
+  return { binHz: (bi * analyser.context.sampleRate) / analyser.fftSize, dB: best };
+};
+
+// ---- the panel buttons ----
+document.getElementById('start').onclick = () => window.startAudio();
+document.getElementById('play').onclick = () => window.play();
+document.getElementById('stop').onclick = () => window.stop();
+document.getElementById('au-corner').onclick = async () => {
+  const r = await window.setPluginParam(E2E.track, 0, E2E.loFreq, E2E.corner);
+  log('set corner 8000: rc=' + (r && r.rc));
+};
+document.getElementById('au-add2').onclick = async () => {
+  const i0 = await window.auAddPoint(E2E.track, 0, E2E.loGain, 0.2, 0.0, 0.0);
+  const i1 = await window.auAddPoint(E2E.track, 0, E2E.loGain, 1.0, -20.0, 0.0);
+  log('ramp points: idx ' + i0 + ', idx ' + i1);
+};
+document.getElementById('au-read').onclick = async () => {
+  const n = await window.auGetNumPoints(E2E.track, 0, E2E.loGain);
+  log('num_points: ' + n);
+  for (let i = 0; i < Math.min(n || 0, 6); i++) {
+    const p = await window.auGetPoint(E2E.track, 0, E2E.loGain, i);
+    if (p) log(`  [${i}] t=${p.t.toFixed(3)} v=${p.v.toFixed(2)} c=${p.c.toFixed(2)}`);
+  }
+};
+document.getElementById('au-clear').onclick = async () => {
+  const r = await window.auClear(E2E.track, 0, E2E.loGain);
+  log('clear: rc=' + (r && r.rc));
+};
+document.getElementById('au-bypass').onclick = async () => {
+  const cur = await window.auGetBypass(E2E.track, 0, E2E.loGain);
+  const next = cur === 1 ? 0 : 1;
+  await window.auSetBypass(E2E.track, 0, E2E.loGain, next);
+  log('bypass: ' + next);
+};
+document.getElementById('au-1point').onclick = async () => {
+  await window.auClear(E2E.track, 0, E2E.loGain);
+  const i = await window.auAddPoint(E2E.track, 0, E2E.loGain, 0.5, 0.3, 0.0);
+  await window.setPluginParam(E2E.track, 0, E2E.loGain, -6.0);
+  const p = await window.auGetPoint(E2E.track, 0, E2E.loGain, 0);
+  log('1-point follow: idx ' + i + ' → v=' + (p ? p.v.toFixed(2) : '??') + ' (expect -6)');
+};
+document.getElementById('f-insert').onclick = async () => {
+  folderId = await window.insertFolder('e2e-folder', 0);
+  log('folder inserted: id ' + folderId);
+};
+document.getElementById('f-children').onclick = async () => {
+  if (!folderId) { log('insert the folder first'); return; }
+  child1 = await window.addTrackInFolder(folderId, 'e2e-child1');
+  child2 = await window.addTrackInFolder(folderId, 'e2e-child2');
+  post({ type: 'insert-wave-clip', trackId: child1, name: E2E.name,
+         startSec: 0.0, lengthSec: 2.0 });
+  const i1 = await waitFor('wave-clip-inserted');
+  post({ type: 'insert-wave-clip', trackId: child2, name: E2E.name,
+         startSec: 0.0, lengthSec: 2.0 });
+  const i2 = await waitFor('wave-clip-inserted');
+  log(`children: ${child1}, ${child2} (clips rc ${i1 && i1.rc}, ${i2 && i2.rc})`);
+};
+document.getElementById('f-fader').onclick = async () => {
+  if (!folderId) { log('insert the folder first'); return; }
+  const r = await window.setFolderVolumeDb(folderId, -6.0);
+  log('folder fader -6: rc=' + (r && r.rc));
+};
+document.getElementById('f-flat').onclick = async () => {
+  const r = await window.setFolderVolumeDb(folderId, 0.0);
+  log('folder fader 0: rc=' + (r && r.rc));
+};
+document.getElementById('f-mute').onclick = async () => {
+  const r = await window.setFolderMute(folderId, true);
+  log('folder mute: rc=' + (r && r.rc));
+  setTimeout(() => window.setFolderMute(folderId, false), 2000);
+};
+document.getElementById('f-read').onclick = async () => {
+  const n = await window.numFolderTracks();
+  log('num folders: ' + n);
+  for (let i = 0; i < (n || 0); i++) {
+    const id = await window.getFolderTrackId(i);
+    log('  folder[' + i + '] id ' + id);
+  }
+  for (let t = 0; t < (numTracks || 0); t++) {
+    const p = await window.getTrackParentFolder(t);
+    log('  track[' + t + '] parent ' + p);
+  }
+};
+document.getElementById('c-move').onclick = async () => {
+  if (!itemId || child1 < 0) { log('need the clip + the children first'); return; }
+  const r = await window.moveClipToTrack(itemId, child1);
+  log('moveTo: rc=' + (r && r.result));
+};
+document.getElementById('c-counters').onclick = async () => {
+  const rb = await window.getGraphRebuildCount();
+  const rq = await window.getRebuildRequestCount();
+  const te = await window.getTransportEvents();
+  log(`rebuild=${rb} request=${rq} transport-events=${te}`);
+};
+document.getElementById('gh-run').onclick = async () => {
+  // the G-H divergence scenario (the E2d twin's G-E class): a mid-play
+  // tree-write → restartPlayback → the pump delivers it → the RMS
+  // time-series + the rebuild-rate reading (the P2-2 third instrument).
+  if (!clipInserted) { log('start the engine first'); return; }
+  await window.seek(0.2);
+  await window.play();
+  await new Promise((r) => setTimeout(r, 300));
+  window.__ghData = { rms: [], times: [], rb0: null, rq0: null, t0: performance.now() };
+  window.__ghData.rb0 = await window.getGraphRebuildCount();
+  window.__ghData.rq0 = await window.getRebuildRequestCount();
+  // the mid-play clip-gain write (the E2c LIVE setter — the same scenario
+  // the E2d divergence twin ran)
+  await window.setClipGain(E2E.track, clipIdx, -12.0);
+  const iv = setInterval(() => {
+    if (!window.__ghData) { clearInterval(iv); return; }
+    window.__ghData.rms.push(window.tapRms());
+    window.__ghData.times.push(performance.now() - window.__ghData.t0);
+  }, 60);
+  setTimeout(async () => {
+    clearInterval(iv);
+    const rb = await window.getGraphRebuildCount();
+    const rq = await window.getRebuildRequestCount();
+    if (window.__ghData) {
+      window.__ghData.rbDelta = rb - window.__ghData.rb0;
+      window.__ghData.rqDelta = rq - window.__ghData.rq0;
+      window.__ghData.spanSec = (performance.now() - window.__ghData.t0) / 1000;
+      log(`G-H: rebuilds ${window.__ghData.rbDelta} / requests ${window.__ghData.rqDelta} over ${window.__ghData.spanSec.toFixed(1)} s (the rate data is in window.__ghData)`);
+    }
+    await window.stop();
+  }, 4000);
+  log('G-H running (4 s)…');
+};
+</script>
+<script>
+// the test helpers (the shared E2c/E2a surface — clip insert + track mute)
+window.__insertClipPage = async function (trackId) {
+  post({ type: 'insert-wave-clip', trackId: trackId | 0, name: E2E.name,
+         startSec: 0.0, lengthSec: 2.0 });
+  return await waitFor((r) => r.type === 'wave-clip-inserted' && r.trackId === (trackId | 0));
+};
+window.__insertLongClipPage = async function (trackId) {
+  post({ type: 'insert-wave-clip', trackId: trackId | 0, name: E2E.nameLong,
+         startSec: 0.0, lengthSec: 4.0 });
+  return await waitFor((r) => r.type === 'wave-clip-inserted' && r.trackId === (trackId | 0));
+};
+window.__muteTrackPage = async function (trackId, mute) {
+  // the worklet's set-track-mute is fire-and-forget (a warn on rc != 0,
+  // no success reply) — post + a settled delay, then verify by effect
+  post({ type: 'set-track-mute', trackId: trackId | 0, muted: !!mute });
+  await new Promise((r) => setTimeout(r, 150));
+  return { trackId: trackId | 0, muted: !!mute };
+};
+
+// The test surface (window.__phaseE2e — the harness entry points)
+window.__phaseE2e = {
+  state: () => ({ engineReady, audioRunning, numTracks, registered,
+                 clipInserted, clipIdx, itemId, folderId, child1, child2,
+                 analyser: !!analyser, pumpIntervalMs }),
+  startAudio: () => window.startAudio(),
+  setPumpInterval: (ms) => window.setPumpInterval(ms),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (s) => window.seek(s),
+  tapRms: () => window.tapRms(),
+  tapSpectrum: () => window.tapSpectrum(),
+  setPluginParam: (t, p, pid, v) => window.setPluginParam(t, p, pid, v),
+  getPluginParam: (t, p, pid) => window.getPluginParam(t, p, pid),
+  auGetNumPoints: (t, p, pid) => window.auGetNumPoints(t, p, pid),
+  auGetPoint: (t, p, pid, i) => window.auGetPoint(t, p, pid, i),
+  auAddPoint: (t, p, pid, tt, v, c) => window.auAddPoint(t, p, pid, tt, v, c),
+  auRemovePoint: (t, p, pid, i) => window.auRemovePoint(t, p, pid, i),
+  auSetPointValue: (t, p, pid, i, v) => window.auSetPointValue(t, p, pid, i, v),
+  auSetPointCurve: (t, p, pid, i, c) => window.auSetPointCurve(t, p, pid, i, c),
+  auClear: (t, p, pid) => window.auClear(t, p, pid),
+  auSetBypass: (t, p, pid, b) => window.auSetBypass(t, p, pid, b),
+  auGetBypass: (t, p, pid) => window.auGetBypass(t, p, pid),
+  auGetParamRange: (t, p, pid) => window.auGetParamRange(t, p, pid),
+  insertFolder: (n, p) => window.insertFolder(n, p),
+  addTrackInFolder: (f, n) => window.addTrackInFolder(f, n),
+  moveTrackToFolder: (t, f) => window.moveTrackToFolder(t, f),
+  getTrackItemId: (t) => window.getTrackItemId(t),
+  numFolderTracks: () => window.numFolderTracks(),
+  getFolderTrackId: (i) => window.getFolderTrackId(i),
+  getTrackParentFolder: (t) => window.getTrackParentFolder(t),
+  setFolderVolumeDb: (f, d) => window.setFolderVolumeDb(f, d),
+  setFolderMute: (f, m) => window.setFolderMute(f, m),
+  moveClipToTrack: (id, t) => window.moveClipToTrack(id, t),
+  getGraphRebuildCount: () => window.getGraphRebuildCount(),
+  getRebuildRequestCount: () => window.getRebuildRequestCount(),
+  resetRebuildCounters: () => window.resetRebuildCounters(),
+  getTransportEvents: () => window.getTransportEvents(),
+  getTrackLevel: (t) => window.getTrackLevel(t),
+  getMasterLevel: () => window.getMasterLevel(),
+  getClipInfo: (t, i) => window.getClipInfo(t, i),
+  numClips: (t) => window.numClips(t),
+  getEditXml: () => window.getEditXml(),
+  setClipGain: (t, i, g) => window.setClipGain(t, i, g),
+  runGH: () => document.getElementById('gh-run').onclick(),
+  ghData: () => window.__ghData || null,
+};
+</script>
+</body>
+</html>

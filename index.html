@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>web-daw-nxt — engine demos</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 15px/1.6 system-ui, sans-serif; background: #0e1116; color: #d7dee8; margin: 0; display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+  main { max-width: 640px; padding: 40px 28px; }
+  h1 { font-size: 22px; margin: 0 0 6px; } h1 b { color: #7cc6ff; }
+  p.sub { color: #8b97a6; margin: 0 0 26px; font-size: 14px; }
+  a.card { display: block; color: inherit; text-decoration: none; border: 1px solid #232b36; border-radius: 12px; padding: 14px 18px; margin: 10px 0; background: #141a22; }
+  a.card:hover { border-color: #7cc6ff; }
+  a.card b { color: #7cc6ff; } a.card span { display: block; color: #8b97a6; font-size: 13px; margin-top: 2px; }
+  .foot { margin-top: 28px; font-size: 12.5px; color: #66717f; }
+  .foot a { color: #8fa8c0; }
+</style>
+</head>
+<body>
+<main>
+  <h1><b>web-daw-nxt</b> — engine demos</h1>
+  <p class="sub">The Tracktion engine compiled to WebAssembly, running live in your browser — audio, sequencing, plugins, all of it.</p>
+
+  <a class="card" href="v2-demo.html"><b>▶ THE V2 VALIDATION DEMO (start here)</b>
+    <span>Boots the real engine, builds an 8-bar arrangement, full UI: timeline, live keyboard, mixer, inspector (pitch/speed/automation), analysis, and a 14-test measured verify suite.</span></a>
+
+  <a class="card" href="phase-exit-demo.html"><b>Phase-exit demo — 4-osc synth + MIDI sequence + sfizz</b><span>The E-round exit gate, as originally gated.</span></a>
+  <a class="card" href="phase-e4e-demo.html"><b>E4e — stretch / varispeed</b><span>Signalsmith STFT pitch-shift and true varispeed on wave clips.</span></a>
+  <a class="card" href="phase-e4d-demo.html"><b>E4d — loudness analysis</b><span>Peak / true-peak / RMS / LUFS analysis export, in-browser.</span></a>
+  <a class="card" href="phase-e2f-demo.html"><b>E2f — the mute/kill contract</b><span>The all-notes-off fix, auditable live.</span></a>
+  <a class="card" href="phase-e3-demo.html"><b>E3 — busses, sends, reverb IR</b><span>Bus routing, pre/post sends, convolution reverb.</span></a>
+
+  <div class="foot">
+    Full demo history: e1 · e2a–e2f · e3 · e4a–e4e · exit · v2 — all <code>phase-*-demo.html</code> files in this deployment.<br>
+    Licensing: the WebAssembly engine embeds GPL/AGPL-licensed Tracktion engine code — see <a href="LICENSE-NOTE.md">LICENSE-NOTE.md</a>.
+  </div>
+</main>
+</body>
+</html>

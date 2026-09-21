@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase E2c — Audio in the timeline</title>
+<style>
+  body { font-family: ui-monospace, monospace; background: #111; color: #ddd;
+         margin: 0; padding: 18px; max-width: 780px; }
+  h1 { font-size: 15px; color: #8fd; margin: 0 0 6px; }
+  p.sub { font-size: 11px; color: #999; margin: 0 0 14px; }
+  button { margin: 4px 4px 4px 0; padding: 6px 12px; font-size: 12px;
+           background: #222; color: #dfd; border: 1px solid #456; cursor: pointer; }
+  #log { font-size: 11px; white-space: pre-wrap; background: #000;
+         color: #9c9; border: 1px solid #333; padding: 8px; height: 220px;
+         overflow-y: scroll; }
+  #status { font-size: 12px; color: #fd8; margin: 10px 0; }
+</style>
+</head>
+<body>
+<h1>Phase E2c — audio in the timeline (memory-buffer wave clips)</h1>
+<p class="sub">A generated pure-float 440 Hz stereo PCM registered as
+/memory/e2c.wav (registerMemoryBuffer — Route A), inserted as a wave clip
+on track 1, with the LIVE clip level (gain/pan/mute), pre-play fades, the
+13-field info readback, and the E2b mixer composition (a send from the
+clip track). Measurement taps: RMS + dominant frequency (AnalyserNode,
+smoothing 0 — the §6b discipline). Requires the E2c wasm build.</p>
+<button id="start">start audio + engine + register + insert</button>
+<button id="play">play</button>
+<button id="mute">LIVE: mute the clip</button>
+<button id="gain">LIVE: clip gain -12 dB</button>
+<button id="stop">stop</button>
+<div id="status">idle</div>
+<div id="log"></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000;
+const E2C = {
+  freq: 440.0, amp: 0.5,
+  frames: 96000,             // 2.0 s
+  start: 0.25, len: 2.0,     // the clip window
+  name: 'e2c', track: 1,
+};
+
+let audioCtx = null, workletNode = null, analyser = null;
+let engineReady = false, audioRunning = false;
+let numTracks = 1, clipInserted = false, registered = false;
+let clipIdx = -1;
+const replies = [];
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(s) { logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+function setStatus(s) { statusEl.textContent = s; }
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+function waitFor(type, ms = 6000, match = null) {
+  // CONSUME-ONCE (the §6e.3 discipline): the matched reply is REMOVED —
+  // a stale same-shape reply can never shadow a fresh query's answer.
+  const pred = typeof type === 'function' ? type
+    : (r) => r.type === type && (!match || match(r));
+  const t0 = performance.now();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const idx = replies.findIndex(pred);
+      if (idx >= 0) { clearInterval(iv); resolve(replies.splice(idx, 1)[0]); }
+      else if (performance.now() - t0 > ms) { clearInterval(iv); resolve(null); }
+    }, 30);
+  });
+}
+
+function workletOnMessage(d) {
+  if (d && d.type === 'warn') log('WARN: ' + d.message);
+  if (d && (d.type === 'ready' || d.type === 'track-added' ||
+            // the E2c reply family (the collector completeness lesson —
+            // a reply type MISSING here is silently DROPPED, §6e.3)
+            d.type === 'audio-buffer-registered' ||
+            d.type === 'audio-buffer-unregistered' ||
+            d.type === 'wave-clip-inserted' ||
+            d.type === 'num-wave-clips' ||
+            d.type === 'wave-clip-info' ||
+            d.type === 'clip-gain-set' || d.type === 'clip-pan-set' ||
+            d.type === 'clip-mute-set' || d.type === 'clip-fades-set' ||
+            d.type === 'edit-xml' ||
+            // the E2b family (the composition leg: the send from the clip
+            // track rides the E2b surface)
+            d.type === 'aux-bus-added' || d.type === 'aux-send-added' ||
+            d.type === 'aux-send-count' || d.type === 'aux-send-gain-set' ||
+            d.type === 'track-level' || d.type === 'master-level'))
+    replies.push(d);
+}
+
+// ---- the gate asset, in-page: pure-float PLANAR stereo (no quantization) ----
+function e2cSinePcm(freq, frames, chans, amp) {
+  const out = new Float32Array(frames * chans);
+  for (let i = 0; i < frames; i++) {
+    const v = amp * Math.sin((2 * Math.PI * freq * i) / SAMPLE_RATE);
+    out[i] = v;
+    if (chans === 2) out[frames + i] = v;
+  }
+  return out;
+}
+
+// ============================================================================
+// Audio startup (the phase10/e2a/e2b pattern: analyser tap, smoothing 0)
+// ============================================================================
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => workletOnMessage(e.data);
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`wasm fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    post({ type: 'init-wasm', wasmBinary, instrument: 'none', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = ready && ready.engineCreated === true;
+    log('engine ready: ' + engineReady);
+    audioRunning = true;
+    // the page-driven pump (§6a.5)
+    setInterval(() => { if (workletNode) post({ type: 'pump' }); }, 100);
+    // the audio-clip track (insert-only pre-play)
+    post({ type: 'add-track', name: 'e2c-main' });
+    const t = await waitFor('track-added');
+    numTracks = t ? t.numTracks : 1;
+    log('tracks: ' + numTracks);
+    // register the PCM (planar stereo; the wrapper interleaves)
+    const pcm = e2cSinePcm(E2C.freq, E2C.frames, 2, E2C.amp);
+    post({ type: 'register-audio-buffer', name: E2C.name, pcm,
+           numFrames: E2C.frames, numChannels: 2, sampleRate: SAMPLE_RATE });
+    const reg = await waitFor('audio-buffer-registered');
+    if (!reg || reg.rc !== 0) { setStatus('register FAILED rc=' + (reg && reg.rc)); return; }
+    registered = true;
+    log('buffer registered: ' + E2C.name);
+    // insert the clip
+    post({ type: 'insert-wave-clip', trackId: E2C.track, name: E2C.name,
+           startSec: E2C.start, lengthSec: E2C.len });
+    const ins = await waitFor('wave-clip-inserted');
+    if (!ins || ins.rc < 0) { setStatus('insert FAILED rc=' + (ins && ins.rc)); return; }
+    clipIdx = ins.clipIdx;
+    clipInserted = true;
+    log('clip inserted: idx ' + clipIdx);
+    setStatus(engineReady ? 'engine + clip ready' : 'engine FAILED');
+  } catch (e) {
+    setStatus('ERROR: ' + String(e)); log('startAudio threw: ' + String(e));
+  }
+};
+
+// ============================================================================
+// The E2c surface entry points (the flow under test)
+// ============================================================================
+window.registerBuffer = async function (name, pcm, frames, chans, rate) {
+  post({ type: 'register-audio-buffer', name: String(name), pcm,
+         numFrames: frames | 0, numChannels: chans | 0,
+         sampleRate: Number(rate) || SAMPLE_RATE });
+  return await waitFor((r) => r.type === 'audio-buffer-registered' &&
+                                r.name === String(name));
+};
+window.unregisterBuffer = async function (name) {
+  post({ type: 'unregister-audio-buffer', name: String(name) });
+  return await waitFor((r) => r.type === 'audio-buffer-unregistered' &&
+                                r.name === String(name));
+};
+window.insertClip = async function (trackId, name, start, len) {
+  post({ type: 'insert-wave-clip', trackId: trackId | 0, name: String(name),
+         startSec: Number(start), lengthSec: Number(len) });
+  return await waitFor((r) => r.type === 'wave-clip-inserted' &&
+                                r.trackId === (trackId | 0) &&
+                                r.name === String(name));
+};
+window.numClips = async function (trackId) {
+  post({ type: 'num-wave-clips', trackId: trackId | 0 });
+  const r = await waitFor((r) => r.type === 'num-wave-clips' && r.trackId === (trackId | 0));
+  return r ? r.num : null;
+};
+window.getClipInfo = async function (trackId, idx) {
+  post({ type: 'get-wave-clip-info', trackId: trackId | 0, clipIdx: idx | 0 });
+  const r = await waitFor((r) => r.type === 'wave-clip-info' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+  return r ? r.info : null;
+};
+window.setClipGain = async function (trackId, idx, gainDb) {
+  post({ type: 'set-clip-gain', trackId: trackId | 0, clipIdx: idx | 0,
+         gainDb: Number(gainDb) });
+  return await waitFor((r) => r.type === 'clip-gain-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+window.setClipPan = async function (trackId, idx, pan) {
+  post({ type: 'set-clip-pan', trackId: trackId | 0, clipIdx: idx | 0,
+         pan: Number(pan) });
+  return await waitFor((r) => r.type === 'clip-pan-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+window.setClipMute = async function (trackId, idx, mute) {
+  post({ type: 'set-clip-mute', trackId: trackId | 0, clipIdx: idx | 0,
+         muted: !!mute });
+  return await waitFor((r) => r.type === 'clip-mute-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+window.setClipFades = async function (trackId, idx, fadeIn, fadeOut) {
+  post({ type: 'set-clip-fades', trackId: trackId | 0, clipIdx: idx | 0,
+         fadeInSec: Number(fadeIn), fadeOutSec: Number(fadeOut) });
+  return await waitFor((r) => r.type === 'clip-fades-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+// the E2b composition entry points (the send from the clip track)
+window.addBus = async function (busName, busNum) {
+  post({ type: 'add-aux-bus', busName: String(busName ?? 'e2c-bus'),
+         busNum: (busNum ?? 0) | 0 });
+  return await waitFor('aux-bus-added');
+};
+window.addSend = async function (trackId, busNum, gainDb) {
+  post({ type: 'add-aux-send', trackId: trackId | 0, busNum: busNum | 0,
+         gainDb: Number(gainDb) });
+  return await waitFor((r) => r.type === 'aux-send-added' &&
+                                r.trackId === (trackId | 0) && r.busNum === (busNum | 0));
+};
+window.getEditXml = async function () {
+  post({ type: 'get-edit-xml' });
+  const r = await waitFor('edit-xml');
+  return r ? r.xml : null;
+};
+
+window.play = async function () { post({ type: 'transport-play' }); };
+window.stop = async function () { post({ type: 'transport-stop' }); };
+window.seek = async function (sec) { post({ type: 'seek', seconds: sec }); };
+
+// ============================================================================
+// Measurement taps (the phase10 pattern — the analyser is the waveform check)
+// ============================================================================
+window.tapRms = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(d);
+  let s = 0;
+  for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+  return Math.sqrt(s / d.length);
+};
+window.tapSpectrum = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(d);
+  let best = -Infinity, bi = -1;
+  for (let i = 1; i < d.length; i++) if (d[i] > best) { best = d[i]; bi = i; }
+  return { binHz: (bi * analyser.context.sampleRate) / analyser.fftSize, dB: best };
+};
+
+// ============================================================================
+// The test surface (window.__phaseE2c — the harness entry points)
+// ============================================================================
+window.__phaseE2c = {
+  state: () => ({ engineReady, audioRunning, numTracks, registered,
+                 clipInserted, clipIdx, analyser: !!analyser }),
+  startAudio: () => window.startAudio(),
+  registerBuffer: (n, p, f, c, r) => window.registerBuffer(n, p, f, c, r),
+  unregisterBuffer: (n) => window.unregisterBuffer(n),
+  insertClip: (t, n, s, l) => window.insertClip(t, n, s, l),
+  numClips: (t) => window.numClips(t),
+  getClipInfo: (t, i) => window.getClipInfo(t, i),
+  setClipGain: (t, i, g) => window.setClipGain(t, i, g),
+  setClipPan: (t, i, p) => window.setClipPan(t, i, p),
+  setClipMute: (t, i, m) => window.setClipMute(t, i, m),
+  setClipFades: (t, i, fi, fo) => window.setClipFades(t, i, fi, fo),
+  addBus: (n, b) => window.addBus(n, b),
+  addSend: (t, b, g) => window.addSend(t, b, g),
+  getEditXml: () => window.getEditXml(),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (s) => window.seek(s),
+  tapRms: () => window.tapRms(),
+  tapSpectrum: () => window.tapSpectrum(),
+};
+
+document.getElementById('start').onclick = () => window.startAudio();
+document.getElementById('play').onclick = () => window.play();
+document.getElementById('mute').onclick = async () => {
+  const r = await window.setClipMute(E2C.track, clipIdx, true);
+  log('clip muted: ' + JSON.stringify(r));
+};
+document.getElementById('gain').onclick = async () => {
+  const r = await window.setClipGain(E2C.track, clipIdx, -12.0);
+  log('clip gain -12: ' + JSON.stringify(r));
+};
+document.getElementById('stop').onclick = () => window.stop();
+</script>
+</body>
+</html>

@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 10 — Basic Effects: 3-Band EQ (Tracktion engine, WASM)</title>
+<!--
+  Phase 10 demo: the Phase 9 multi-track mixer + a WasmEQPlugin (3-band
+  RBJ biquad EQ: low-shelf / peaking / high-shelf) on EVERY track, inserted
+  between the instrument and the fader — all DSP inside the WASM engine,
+  zero WebAudio native nodes. Band parameter writes are LIVE per render
+  block (no rebuild); the EQ itself is inserted before the first play.
+
+  Architecture (all the Phase 6 AudioWorklet fixes + Phase 8 lifecycle rules
+  apply — see public/wasm/phase5-processor.js):
+    page ──postMessage──▶ phase5-processor (worklet)
+                        └─▶ add_eq_on_track / set_eq_band_on_track /
+                            get_eq_param_on_track (+ the full Phase 9 set:
+                            tracks, samplers, mixer, master, input-select)
+                            → the Tracktion engine in WASM
+
+  Constraints honoured (SKILL §6a):
+    - tracks + samplers + EQs are added BEFORE the first transport play
+      (the graph builds at that point)
+    - EQ band writes are parameter writes — live per block, NO rebuild
+    - deletions/edits → rebuild-engine (reset-by-reinstantiation) + re-apply
+    - the page drives the ~100ms pump (deferred engine work during playback)
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0a0a0a; color: #e4e4e7;
+    font-family: system-ui, -apple-system, sans-serif; padding: 24px;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #a1a1aa; font-size: 13px; margin-bottom: 16px; }
+  .panel {
+    background: #18181b; border: 1px solid #27272a; border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 14px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button {
+    background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+  }
+  button:hover:not(:disabled) { background: #3f3f46; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: #7c3aed; border-color: #8b5cf6; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #8b5cf6; }
+  button.active { background: #f59e0b; border-color: #fbbf24; color: #18181b; font-weight: 600; }
+  button.toggled { background: #f59e0b; border-color: #fbbf24; color: #18181b; }
+  label { font-size: 12px; color: #a1a1aa; }
+  input[type="range"] { width: 110px; }
+  .val { font-size: 12px; color: #d4d4d8; font-variant-numeric: tabular-nums; min-width: 44px; display: inline-block; }
+
+  /* Track strips */
+  .track {
+    display: flex; gap: 12px; align-items: center; padding: 10px 12px;
+    border: 1px solid #27272a; border-radius: 8px; margin-bottom: 8px;
+    background: #111113; flex-wrap: wrap;
+  }
+  .track.selected { outline: 2px solid #8b5cf6; }
+  .track .chip {
+    width: 12px; height: 12px; border-radius: 3px; flex: none;
+  }
+  .track .name { font-weight: 600; min-width: 64px; }
+  .track .ctl { display: flex; align-items: center; gap: 6px; }
+  .muted-look { opacity: 0.45; }
+
+  /* Master meter */
+  .meter {
+    width: 220px; height: 14px; background: #27272a; border-radius: 4px;
+    overflow: hidden; position: relative; flex: none;
+  }
+  .meter .fill {
+    position: absolute; inset: 0 auto 0 0; width: 0%;
+    background: linear-gradient(90deg, #22c55e 0%, #84cc16 60%, #f59e0b 85%, #ef4444 100%);
+    transition: width 60ms linear;
+  }
+
+  canvas#roll { background: #111113; border: 1px solid #27272a; border-radius: 6px; display: block; }
+  #logs {
+    font-family: ui-monospace, monospace; font-size: 11px; color: #a1a1aa;
+    white-space: pre-wrap; max-height: 150px; overflow-y: auto;
+  }
+  #error-box {
+    background: #7f1d1d; color: #fecaca; padding: 10px 14px; border-radius: 6px;
+    margin-bottom: 12px; display: none; font-size: 13px;
+  }
+  .status { font-family: ui-monospace, monospace; font-size: 12px; color: #d4d4d8; }
+  .keys { display: flex; gap: 2px; margin-top: 8px; flex-wrap: wrap; }
+  .keys button { padding: 6px 7px; font-size: 10px; min-width: 26px; }
+
+  /* Phase 10: EQ band rows */
+  .eq-band {
+    display: flex; gap: 18px; align-items: center; padding: 7px 10px;
+    border: 1px solid #27272a; border-radius: 8px; margin-bottom: 6px;
+    background: #111113; flex-wrap: wrap;
+  }
+  .eq-band .band-label {
+    font-family: ui-monospace, monospace; font-size: 11px; color: #a78bfa;
+    min-width: 76px; font-weight: 600;
+  }
+</style>
+</head>
+<body>
+<h1>Phase 10 — Basic Effects: 3-Band EQ</h1>
+<div class="subtitle">Tracktion engine in WASM · 3 tracks × samplers × WasmEQPlugin (RBJ biquads) · per-track volume/pan/mute/solo + master · all DSP inside the engine · EQ writes live per block</div>
+
+<div id="error-box" class="error"></div>
+
+<div class="panel">
+  <div class="row" style="margin-bottom:10px">
+    <button id="btn-start" class="primary" onclick="startAudio()">Start Audio</button>
+    <button id="btn-play" onclick="play()" disabled>▶ Play</button>
+    <button id="btn-stop" onclick="stop()" disabled>■ Stop</button>
+    <label>BPM <input id="bpm" type="number" min="40" max="240" value="120" style="width:64px" onchange="setBpm(this.value)"></label>
+    <label><input type="checkbox" id="erase-mode" onchange="eraseMode=this.checked"> erase mode</label>
+    <button id="btn-clear" onclick="clearSelected()" disabled>Clear track</button>
+    <span class="status" id="status" style="margin-left:auto">idle</span>
+  </div>
+  <div class="row"><div class="meter"><div class="fill" id="master-meter"></div></div>
+    <label>Master <input id="master-vol" type="range" min="0" max="2" step="0.01" value="1" oninput="setMaster(this.value)"></label>
+    <span class="val" id="master-vol-val">1.00</span>
+  </div>
+</div>
+
+<div class="panel" id="tracks-panel">
+  <div style="font-size:12px;color:#a1a1aa;margin-bottom:8px">Tracks — click a strip to select it (the piano roll + live keyboard + the EQ below target the selected track)</div>
+  <div id="track-list"></div>
+</div>
+
+<div class="panel" id="eq-panel">
+  <div style="font-size:12px;color:#a1a1aa;margin-bottom:8px">EQ — <b id="eq-track-name">Lead</b> · 3-band RBJ biquad (low-shelf / peak / high-shelf) · inserts before the fader · band changes apply LIVE per block (no rebuild)</div>
+  <div class="eq-band">
+    <span class="band-label">LOW&nbsp;SHELF</span>
+    <span class="ctl"><label>freq <input id="eq0-freq" type="range" min="20" max="2000" step="1" value="200" oninput="setEqParam(0, 0, this.value)"></label>
+      <span class="val" id="eq0-freq-val">200 Hz</span></span>
+    <span class="ctl"><label>gain <input id="eq0-gain" type="range" min="-24" max="24" step="0.5" value="0" oninput="setEqParam(0, 1, this.value)"></label>
+      <span class="val" id="eq0-gain-val">0.0 dB</span></span>
+    <span class="ctl"><label>Q <input id="eq0-q" type="range" min="0.3" max="8" step="0.01" value="0.707" oninput="setEqParam(0, 2, this.value)"></label>
+      <span class="val" id="eq0-q-val">0.71</span></span>
+  </div>
+  <div class="eq-band">
+    <span class="band-label">MID&nbsp;PEAK</span>
+    <span class="ctl"><label>freq <input id="eq1-freq" type="range" min="100" max="8000" step="1" value="1000" oninput="setEqParam(1, 0, this.value)"></label>
+      <span class="val" id="eq1-freq-val">1000 Hz</span></span>
+    <span class="ctl"><label>gain <input id="eq1-gain" type="range" min="-24" max="24" step="0.5" value="0" oninput="setEqParam(1, 1, this.value)"></label>
+      <span class="val" id="eq1-gain-val">0.0 dB</span></span>
+    <span class="ctl"><label>Q <input id="eq1-q" type="range" min="0.3" max="8" step="0.01" value="0.707" oninput="setEqParam(1, 2, this.value)"></label>
+      <span class="val" id="eq1-q-val">0.71</span></span>
+  </div>
+  <div class="eq-band">
+    <span class="band-label">HIGH&nbsp;SHELF</span>
+    <span class="ctl"><label>freq <input id="eq2-freq" type="range" min="1000" max="20000" step="1" value="8000" oninput="setEqParam(2, 0, this.value)"></label>
+      <span class="val" id="eq2-freq-val">8000 Hz</span></span>
+    <span class="ctl"><label>gain <input id="eq2-gain" type="range" min="-24" max="24" step="0.5" value="0" oninput="setEqParam(2, 1, this.value)"></label>
+      <span class="val" id="eq2-gain-val">0.0 dB</span></span>
+    <span class="ctl"><label>Q <input id="eq2-q" type="range" min="0.3" max="8" step="0.01" value="0.707" oninput="setEqParam(2, 2, this.value)"></label>
+      <span class="val" id="eq2-q-val">0.71</span></span>
+  </div>
+  <button id="btn-eq-flat" onclick="setEqFlat()">Flatten EQ</button>
+</div>
+
+<div class="panel">
+  <div style="font-size:12px;color:#a1a1aa;margin-bottom:6px">Piano roll — click/drag to draw on the selected track · erase mode removes (engine rebuild)</div>
+  <canvas id="roll" width="1020" height="340"></canvas>
+  <div class="keys" id="keys"></div>
+</div>
+
+<div class="panel">
+  <div class="status">
+    <span id="st-ready">engine: —</span> ·
+    <span id="st-pos">0.00s</span> ·
+    <span id="st-playing">stopped</span> ·
+    <span id="st-tracks">tracks: —</span> ·
+    <span id="st-sounds">sounds: —</span> ·
+    <span id="st-rebuilds">rebuilds: 0</span>
+  </div>
+  <div id="logs" style="margin-top:8px"></div>
+</div>
+
+<script>
+'use strict';
+
+// ============================================================================
+// Constants + state
+// ============================================================================
+const SAMPLE_RATE = 48000;
+const BEATS = 16;
+const PITCH_LOW = 48, PITCH_HIGH = 84;
+const BPM_DEFAULT = 120;
+const TRACK_COLORS = ['#a78bfa', '#f472b6', '#34d399'];
+
+// The 3 tracks: each its own WasmSamplerPlugin "instrument" (timbre) + notes.
+// trackNotes[t] = [{ pitch, vel, start, len }] in beats (page = source of truth).
+const TRACK_DEFS = [
+  { name: 'Lead',  timbre: [1, 0.25] },        // sine + octave (phase8 sound)
+  { name: 'Organ', timbre: [1, 0.35, 0.22] },  // + 2nd + 3rd harmonics
+  { name: 'Reed',  timbre: [1, 0.5, 0.28, 0.16] }, // brighter stack
+];
+const trackNotes = [[], [], []];
+const trackMixer = [
+  { volume: 1, pan: 0, mute: false, solo: false },
+  { volume: 1, pan: 0, mute: false, solo: false },
+  { volume: 1, pan: 0, mute: false, solo: false },
+];
+// Phase 10: per-track EQ band state (the page is the source of truth —
+// re-applied on engine rebuilds). Band: 0 low-shelf / 1 peak / 2 high-shelf.
+const EQ_FLAT = [
+  { freq: 200, gain: 0, q: 0.707 },
+  { freq: 1000, gain: 0, q: 0.707 },
+  { freq: 8000, gain: 0, q: 0.707 },
+];
+const trackEQ = [ [ {...EQ_FLAT[0]}, {...EQ_FLAT[1]}, {...EQ_FLAT[2]} ],
+                  [ {...EQ_FLAT[0]}, {...EQ_FLAT[1]}, {...EQ_FLAT[2]} ],
+                  [ {...EQ_FLAT[0]}, {...EQ_FLAT[1]}, {...EQ_FLAT[2]} ] ];
+let selectedTrack = 0;
+let numTracks = 1;
+let engineReady = false;
+let audioRunning = false;
+let rebuilds = 0;
+let isPlaying = false;
+let bpm = BPM_DEFAULT;
+let eraseMode = false;
+let lastLevel = 0;
+let lastPosition = 0;
+
+let audioCtx = null, workletNode = null, analyser = null;
+const Ctor = window.AudioContext || window.webkitAudioContext;
+
+function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+// Timbre synthesis: sum of harmonics with a decaying envelope.
+function synthTimbre(note, harmonics, amp, numFrames, sampleRate) {
+  const f = midiToFreq(note);
+  const out = new Float32Array(numFrames);
+  for (let i = 0; i < numFrames; i++) {
+    const t = i / sampleRate;
+    const env = Math.exp(-t * 2.2);
+    let s = 0;
+    for (let h = 0; h < harmonics.length; h++) {
+      s += harmonics[h] * Math.sin(2 * Math.PI * f * (h + 1) * t);
+    }
+    out[i] = amp * env * s;
+  }
+  return out;
+}
+const SOUND_FRAMES = 48000;
+const SOUND_AMP = 0.18;
+
+const soundCache = new Map(); // `${t}:${pitch}` -> Float32Array
+function soundFor(trackId, pitch) {
+  const key = `${trackId}:${pitch}`;
+  if (!soundCache.has(key)) {
+    soundCache.set(key, synthTimbre(pitch, TRACK_DEFS[trackId].timbre, SOUND_AMP, SOUND_FRAMES, SAMPLE_RATE));
+  }
+  return soundCache.get(key);
+}
+
+// Seeded 3-part arrangement (a small round over C-major):
+const SEED = [
+  [ { p: 60, s: 0, l: 1 }, { p: 64, s: 1, l: 1 }, { p: 67, s: 2, l: 1 }, { p: 72, s: 3, l: 1 },
+    { p: 67, s: 4, l: 1 }, { p: 64, s: 5, l: 1 }, { p: 60, s: 6, l: 2 } ],
+  [ { p: 52, s: 0, l: 2 }, { p: 55, s: 2, l: 2 }, { p: 59, s: 4, l: 2 }, { p: 55, s: 6, l: 2 } ],
+  [ { p: 67, s: 1, l: 1 }, { p: 71, s: 3, l: 1 }, { p: 74, s: 5, l: 1 }, { p: 71, s: 7, l: 1 } ],
+];
+
+// ============================================================================
+// Worklet plumbing
+// ============================================================================
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+let readyResolver = null;
+function awaitReady(timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('awaitReady timeout')), timeoutMs);
+    readyResolver = (msg) => { clearTimeout(timer); readyResolver = null; resolve(msg); };
+  });
+}
+
+function log(msg) {
+  const box = document.getElementById('logs');
+  const lines = box.textContent.split('\n').filter((l) => l.trim());
+  lines.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
+  box.textContent = lines.slice(-14).join('\n');
+  box.scrollTop = box.scrollHeight;
+}
+function setError(msg) {
+  const box = document.getElementById('error-box');
+  if (msg) { box.textContent = '⚠️ ' + msg; box.style.display = 'block'; }
+  else box.style.display = 'none';
+}
+function setStatus(txt) { document.getElementById('status').textContent = txt; }
+
+// Push the page's full state into the (fresh) engine.
+async function applyStateToEngine() {
+  post({ type: 'set-bpm', bpm });
+  // Per-track instruments: every pitch gets a sound on every track's sampler.
+  for (let t = 0; t < numTracks; t++) {
+    for (let p = PITCH_LOW; p <= PITCH_HIGH; p++) {
+      post({
+        type: 'sampler-load-sound', trackId: t, rootNote: p, minNote: p, maxNote: p,
+        minVel: 1, maxVel: 127, data: soundFor(t, p),
+        numFrames: SOUND_FRAMES, numChannels: 1, sampleRate: SAMPLE_RATE,
+      });
+    }
+  }
+  // Per-track clips (ALWAYS created — the phase8 P1 lesson) + notes.
+  for (let t = 0; t < numTracks; t++) {
+    post({ type: 'add-midi-clip', trackId: t, startBeat: 0, lengthBeats: BEATS });
+    for (const n of trackNotes[t]) {
+      post({ type: 'add-midi-note', trackId: t, pitch: n.p, velocity: n.vel, startBeat: n.s, lengthBeats: n.l });
+    }
+    // Mixer state re-apply after a rebuild.
+    post({ type: 'set-track-volume', trackId: t, gain: trackMixer[t].volume });
+    post({ type: 'set-track-pan', trackId: t, pan: trackMixer[t].pan });
+    if (trackMixer[t].mute) post({ type: 'set-track-mute', trackId: t, mute: true });
+    if (trackMixer[t].solo) post({ type: 'set-track-solo', trackId: t, solo: true });
+  }
+  post({ type: 'select-input-track', trackId: selectedTrack });
+  // Wire live input AFTER the target is set (deferLiveInput contract).
+  post({ type: 'enable-live-input' });
+  // Phase 10: re-apply each track's EQ band targets (LIVE writes — no
+  // rebuild needed for these, just re-send after the fresh engine).
+  for (let t = 0; t < numTracks; t++) {
+    for (let b = 0; b < 3; b++) {
+      const bp = trackEQ[t][b];
+      post({ type: 'set-eq-band', trackId: t, band: b, freq: bp.freq, gain: bp.gain, q: bp.q });
+    }
+  }
+}
+
+// Full engine reset (deletions / BPM re-flow). Waits for 'ready', re-applies.
+async function rebuildEngine(reason) {
+  if (!engineReady) return;
+  log(`rebuild-engine (${reason})…`);
+  rebuilds++;
+  engineReady = false;
+  post({ type: 'rebuild-engine' });
+  const msg = await awaitReady();
+  engineReady = msg.engineCreated === true;
+  if (engineReady) {
+    // The rebuilt engine starts single-track again: re-create the extra
+    // tracks + their samplers, then re-apply the full state.
+    for (let t = 1; t < TRACK_DEFS.length; t++) post({ type: 'add-track', name: TRACK_DEFS[t].name });
+    for (let t = 0; t < TRACK_DEFS.length; t++) post({ type: 'add-wasm-sampler', trackId: t });
+    // Phase 10: EQs too (insert-only structural — before the next play).
+    for (let t = 0; t < TRACK_DEFS.length; t++) post({ type: 'add-eq', trackId: t });
+    await applyStateToEngine();
+  }
+  updateUI();
+  log(`rebuild done: engine=${engineReady}`);
+}
+
+
+// Ask the worklet for the engine's real track count; poll until it reaches
+// `want` or the timeout (the page must NEVER assume structural state —
+// silent worklet errors are invisible otherwise).
+function waitForTracks(want, timeoutMs) {
+  return new Promise((resolve) => {
+    const started = performance.now();
+    let listener = null;
+    const ask = () => {
+      if (workletNode) post({ type: 'num-tracks' });
+      if (performance.now() - started > timeoutMs) {
+        if (listener && workletNode) workletNode.port.removeEventListener('message', listener);
+        resolve(lastKnownTracks);
+        return;
+      }
+      setTimeout(ask, 150);
+    };
+    const onMsg = (e) => {
+      if (e.data && e.data.type === 'track-count') {
+        lastKnownTracks = e.data.numTracks;
+        if (e.data.numTracks >= want) {
+          if (workletNode) workletNode.port.removeEventListener('message', listener);
+          resolve(e.data.numTracks);
+        }
+      } else if (e.data && e.data.type === 'track-added') {
+        lastKnownTracks = Math.max(lastKnownTracks, e.data.numTracks || 0);
+      }
+    };
+    listener = onMsg;
+    if (workletNode) workletNode.port.addEventListener('message', onMsg);
+    lastKnownTracks = 1;
+    ask();
+  });
+}
+let lastKnownTracks = 1;
+
+// ============================================================================
+// Audio startup
+// ============================================================================
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setError(null);
+    log('Creating AudioContext…');
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    log('AudioWorklet loaded');
+
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    // Measurement tap, not a visual meter: 0 = every getFloatFrequencyData
+    // call returns the fresh FFT of the last fftSize samples. The default
+    // 0.8 (visual meter smoothing) mixes 80% of the PREVIOUS call's
+    // spectrum into every reading, which makes dominant-frequency
+    // attribution lag ~0.5s behind the audio (found by the phase10
+    // spectral-flip browser checks).
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+
+    workletNode.port.onmessage = (e) => { handleWorkletMessage(e.data); };
+
+    // Cache-buster: the phase8 test runs cached this URL with the OLD binary,
+    // which made every Phase 9 export silently missing in the worklet (the
+    // add-track case fell through without a warn — fixed below too).
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`WASM fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    // deferLiveInput: the input target is selected (select-input-track) in
+    // applyStateToEngine BEFORE 'enable-live-input' — the target's
+    // mute-exemption is baked into the graph at build time (§6a.3), and
+    // wiring track 0 at init would exempt it from mute/solo forever.
+    post({ type: 'init-wasm', wasmBinary, instrument: 'sampler', deferLiveInput: true });
+    const ready = await awaitReady();
+    engineReady = ready.engineCreated === true;
+    log(`engine ready: ${engineReady}`);
+    audioRunning = true;
+
+    if (engineReady) {
+      // Phase 9 structure: 2 more tracks + a sampler per track (BEFORE the
+      // first play — the graph builds at transport-play). VERIFY creation
+      // via the engine's track-count (never assume — the TextEncoder lesson:
+      // a silent worklet throw made the page believe 3 tracks existed while
+      // the engine had 1).
+      for (let t = 1; t < TRACK_DEFS.length; t++) {
+        post({ type: 'add-track', name: TRACK_DEFS[t].name });
+      }
+      const okTracks = await waitForTracks(TRACK_DEFS.length, 5000);
+      numTracks = okTracks;
+      if (numTracks < TRACK_DEFS.length) {
+        setError(`engine created only ${numTracks} track(s) — see logs`);
+        log(`FATAL: expected ${TRACK_DEFS.length} tracks, engine has ${numTracks}`);
+      }
+      for (let t = 0; t < numTracks; t++) post({ type: 'add-wasm-sampler', trackId: t });
+      // Phase 10: an EQ on every track, BEFORE the first play (insert-only
+      // structural — same graph-build constraint as the sampler).
+      for (let t = 0; t < numTracks; t++) post({ type: 'add-eq', trackId: t });
+      // Seed the arrangement + first state apply.
+      for (let t = 0; t < numTracks; t++) {
+        trackNotes[t] = SEED[t].map((n) => ({ p: n.p, vel: 100, s: n.s, l: n.l }));
+      }
+      await applyStateToEngine();
+    }
+
+    // The page-driven pump (SKILL §6a.5) + master meter polling.
+    setInterval(() => {
+      if (workletNode) {
+        post({ type: 'pump' });
+        if (engineReady) post({ type: 'get-output-level' });
+      }
+    }, 100);
+
+    updateUI();
+    drawRoll();
+  } catch (e) {
+    setError(String(e));
+    log(`Error: ${e.message}`);
+  }
+};
+
+function handleWorkletMessage(msg) {
+  switch (msg.type) {
+    case 'ready':
+      if (readyResolver) readyResolver(msg);
+      document.getElementById('st-ready').textContent = `engine: ${msg.engineCreated ? 'ready' : 'FAILED'}`;
+      break;
+    case 'position':
+      lastPosition = msg.position || 0;
+      document.getElementById('st-pos').textContent = `${lastPosition.toFixed(2)}s`;
+      document.getElementById('st-playing').textContent = msg.isPlaying ? 'playing' : 'stopped';
+      isPlaying = !!msg.isPlaying;
+      updatePlayhead(msg.position || 0);
+      break;
+    case 'output-level':
+      lastLevel = msg.level || 0;
+      document.getElementById('master-meter').style.width = `${Math.min(100, lastLevel * 100)}%`;
+      break;
+    case 'track-added':
+      log(`track added: id=${msg.trackId} (numTracks=${msg.numTracks})`);
+      numTracks = msg.numTracks || numTracks;
+      document.getElementById('st-tracks').textContent = `tracks: ${numTracks}`;
+      break;
+    // Phase 10: EQ message acks (structural verification — the eq-added
+    // rc is checked by the automation API too)
+    case 'eq-added':
+      if (msg.rc !== 0) setError(`add-eq failed (rc=${msg.rc}) on track ${msg.trackId}`);
+      else log(`EQ added on track ${msg.trackId}`);
+      break;
+    case 'eq-status':
+      log(`EQ on track ${msg.trackId}: ${msg.hasEQ ? 'present' : 'absent'}`);
+      break;
+    case 'eq-param':
+      log(`eq-param t${msg.trackId} band${msg.band} p${msg.param} = ${msg.value}`);
+      break;
+    case 'warn':
+      log(`warn: ${msg.message}`);
+      break;
+    case 'error':
+      setError(msg.error || msg.message);
+      break;
+    default: break;
+  }
+}
+
+// ============================================================================
+// Transport + mixer controls
+// ============================================================================
+window.play = async function () {
+  if (!engineReady) return;
+  post({ type: 'transport-play' });
+  // Page-level deterministic-play belt-and-braces (SKILL §6a.1): the worklet
+  // already retries ×10 inside its transport-play handler, but on this
+  // heavier multi-track state a play can still silently fail to engage —
+  // re-post until the position reports confirm playback, bounded.
+  if (window.__playRetryTimer) clearTimeout(window.__playRetryTimer);
+  let attempts = 0;
+  const retry = () => {
+    if (!isPlaying && engineReady && attempts++ < 5) {
+      log(`play not engaged yet — retrying (attempt ${attempts})`);
+      post({ type: 'transport-play' });
+      window.__playRetryTimer = setTimeout(retry, 1200);
+    }
+  };
+  window.__playRetryTimer = setTimeout(retry, 1200);
+};
+window.stop = function () {
+  if (window.__playRetryTimer) clearTimeout(window.__playRetryTimer);
+  post({ type: 'transport-stop' });
+};
+window.seek = function (sec) { post({ type: 'seek', seconds: sec }); };
+window.setBpm = async function (v) {
+  const newBpm = Math.max(40, Math.min(240, parseInt(v, 10) || BPM_DEFAULT));
+  bpm = newBpm;
+  document.getElementById('bpm').value = String(newBpm);
+  // Notes' beat→time mapping reflows → full rebuild (phase8 rule).
+  await rebuildEngine(`bpm ${newBpm}`);
+};
+window.setMaster = function (v) {
+  const g = parseFloat(v);
+  document.getElementById('master-vol-val').textContent = g.toFixed(2);
+  post({ type: 'set-master-volume', gain: g });
+};
+
+window.selectTrack = function (t) {
+  selectedTrack = t;
+  post({ type: 'select-input-track', trackId: t });
+  renderTrackList();
+  renderEqPanel();
+  drawRoll();
+  log(`selected track ${t} (${TRACK_DEFS[t].name}) — roll + EQ + live input now target it`);
+};
+
+window.setTrackVolume = function (t, v) {
+  trackMixer[t].volume = parseFloat(v);
+  document.getElementById(`t${t}-vol-val`).textContent = parseFloat(v).toFixed(2);
+  post({ type: 'set-track-volume', trackId: t, gain: parseFloat(v) });
+};
+window.setTrackPan = function (t, v) {
+  trackMixer[t].pan = parseFloat(v);
+  document.getElementById(`t${t}-pan-val`).textContent = parseFloat(v).toFixed(2);
+  post({ type: 'set-track-pan', trackId: t, pan: parseFloat(v) });
+};
+window.toggleMute = function (t) {
+  trackMixer[t].mute = !trackMixer[t].mute;
+  post({ type: 'set-track-mute', trackId: t, mute: trackMixer[t].mute });
+  renderTrackList(); drawRoll();
+};
+window.toggleSolo = function (t) {
+  trackMixer[t].solo = !trackMixer[t].solo;
+  post({ type: 'set-track-solo', trackId: t, solo: trackMixer[t].solo });
+  renderTrackList();
+};
+window.clearSelected = async function () {
+  trackNotes[selectedTrack] = [];
+  if (engineReady) await rebuildEngine(`clear track ${selectedTrack}`);
+  drawRoll();
+};
+
+// ============================================================================
+// Phase 10: EQ controls (target the SELECTED track; live per block)
+// ============================================================================
+window.setEqParam = function (band, param, v) {
+  const t = selectedTrack;
+  const value = parseFloat(v);
+  // PR #4 review: guard non-finite input — a NaN here would leave the PAGE
+  // state NaN (renders "NaN Hz", diverges from the engine — which now
+  // rejects NaN writes — and persists across rebuilds). Sliders stay inside
+  // legal ranges; this guards the devtools/test-API path.
+  if (!Number.isFinite(value)) return;
+  if (param === 0)      trackEQ[t][band].freq = value;
+  else if (param === 1) trackEQ[t][band].gain = value;
+  else                  trackEQ[t][band].q = value;
+  renderEqPanel();
+  post({ type: 'set-eq-band', trackId: t, band,
+         freq: trackEQ[t][band].freq, gain: trackEQ[t][band].gain, q: trackEQ[t][band].q });
+};
+window.setEqFlat = function () {
+  for (let b = 0; b < 3; b++) {
+    trackEQ[selectedTrack][b].gain = 0;
+    post({ type: 'set-eq-band', trackId: selectedTrack, band: b,
+           freq: trackEQ[selectedTrack][b].freq, gain: 0, q: trackEQ[selectedTrack][b].q });
+  }
+  renderEqPanel();
+  log(`EQ flattened on track ${selectedTrack}`);
+};
+
+function renderEqPanel() {
+  document.getElementById('eq-track-name').textContent = TRACK_DEFS[selectedTrack].name;
+  for (let b = 0; b < 3; b++) {
+    const bp = trackEQ[selectedTrack][b];
+    document.getElementById(`eq${b}-freq`).value = String(bp.freq);
+    document.getElementById(`eq${b}-freq-val`).textContent = `${Math.round(bp.freq)} Hz`;
+    document.getElementById(`eq${b}-gain`).value = String(bp.gain);
+    document.getElementById(`eq${b}-gain-val`).textContent = `${bp.gain >= 0 ? '+' : ''}${bp.gain.toFixed(1)} dB`;
+    document.getElementById(`eq${b}-q`).value = String(bp.q);
+    document.getElementById(`eq${b}-q-val`).textContent = bp.q.toFixed(2);
+  }
+}
+
+// ============================================================================
+// Piano roll (shared canvas; notes colored per track)
+// ============================================================================
+const canvas = document.getElementById('roll');
+const ctx = canvas.getContext('2d');
+const KEYS_SHOWN = 36; // pitch rows
+const rollW = canvas.width, rollH = canvas.height;
+const cellW = rollW / BEATS, cellH = rollH / KEYS_SHOWN;
+const TOP_PITCH = 84; // top row = C6
+
+function pitchToRow(p) { return TOP_PITCH - p; }
+function rowToPitch(r) { return TOP_PITCH - r; }
+
+let playheadX = -1;
+function updatePlayhead(posSec) {
+  const secPerBeat = 60 / bpm;
+  playheadX = Math.max(0, posSec / secPerBeat) * cellW;
+  drawRoll();
+}
+
+function drawRoll() {
+  ctx.clearRect(0, 0, rollW, rollH);
+  // Grid
+  ctx.strokeStyle = '#27272a'; ctx.lineWidth = 1;
+  for (let b = 0; b <= BEATS; b += 1) {
+    ctx.globalAlpha = (b % 4 === 0) ? 0.9 : 0.35;
+    ctx.beginPath(); ctx.moveTo(b * cellW, 0); ctx.lineTo(b * cellW, rollH); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  for (let r = 0; r <= KEYS_SHOWN; r += 3) {
+    ctx.beginPath(); ctx.moveTo(0, r * cellH); ctx.lineTo(rollW, r * cellH); ctx.stroke();
+  }
+  // Notes (dimmed when their track is muted)
+  for (let t = 0; t < numTracks; t++) {
+    if (t === selectedTrack) continue;
+    drawTrackNotes(t, 0.55);
+  }
+  drawTrackNotes(selectedTrack, 1.0);
+  // Playhead
+  if (playheadX >= 0 && isPlaying) {
+    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(playheadX, 0); ctx.lineTo(playheadX, rollH); ctx.stroke();
+  }
+}
+function drawTrackNotes(t, alpha) {
+  ctx.globalAlpha = trackMixer[t].mute ? alpha * 0.35 : alpha;
+  ctx.fillStyle = TRACK_COLORS[t];
+  for (const n of trackNotes[t]) {
+    const r = pitchToRow(n.p);
+    ctx.fillRect(n.s * cellW + 1, r * cellH + 1, Math.max(3, n.l * cellW - 2), cellH - 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Click/drag: draw a note on the SELECTED track (1 beat). Erase mode removes
+// (deletion → rebuild + re-apply, per the phase8 rules).
+let drawing = false;
+function rollCell(ev) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (rollW / rect.width);
+  const y = (ev.clientY - rect.top) * (rollH / rect.height);
+  return { beat: Math.floor(x / cellW), pitch: rowToPitch(Math.floor(y / cellH)) };
+}
+canvas.addEventListener('pointerdown', async (ev) => {
+  if (!engineReady) return;
+  const { beat, pitch } = rollCell(ev);
+  if (pitch < PITCH_LOW || pitch > PITCH_HIGH || beat < 0 || beat >= BEATS) return;
+  drawing = true;
+  if (eraseMode) {
+    const before = trackNotes[selectedTrack].length;
+    trackNotes[selectedTrack] = trackNotes[selectedTrack].filter((n) => !(n.p === pitch && n.s === beat));
+    if (trackNotes[selectedTrack].length !== before) {
+      await rebuildEngine(`erase note ${pitch}@${beat} (t${selectedTrack})`);
+      drawRoll();
+    }
+    return;
+  }
+  const n = { p: pitch, vel: 100, s: beat, l: 1 };
+  trackNotes[selectedTrack].push(n);
+  post({ type: 'add-midi-note', trackId: selectedTrack, pitch, velocity: 100, startBeat: beat, lengthBeats: 1 });
+  drawRoll();
+});
+canvas.addEventListener('pointerup', () => { drawing = false; });
+
+// ============================================================================
+// On-screen keyboard (routes live MIDI to the selected track)
+// ============================================================================
+const KEY_PITCHES = [60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 79];
+(function buildKeys() {
+  const host = document.getElementById('keys');
+  for (const p of KEY_PITCHES) {
+    const b = document.createElement('button');
+    b.textContent = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][p % 12] + (Math.floor(p / 12) - 1);
+    b.dataset.p = String(p);
+    b.onpointerdown = () => { post({ type: 'note-on', note: p, velocity: 100 }); b.classList.add('toggled'); };
+    b.onpointerup = b.onpointerleave = () => { post({ type: 'note-off', note: p }); b.classList.remove('toggled'); };
+    host.appendChild(b);
+  }
+})();
+
+// ============================================================================
+// Track list UI
+// ============================================================================
+function renderTrackList() {
+  const host = document.getElementById('track-list');
+  host.innerHTML = '';
+  for (let t = 0; t < numTracks; t++) {
+    const d = TRACK_DEFS[t], m = trackMixer[t];
+    const div = document.createElement('div');
+    div.className = 'track' + (t === selectedTrack ? ' selected' : '') + (m.mute ? ' muted-look' : '');
+    div.onclick = (ev) => { if (ev.target === div || ev.target.classList.contains('name') || ev.target.classList.contains('chip')) selectTrack(t); };
+    div.innerHTML = `
+      <span class="chip" style="background:${TRACK_COLORS[t]}"></span>
+      <span class="name">${d.name}${t === selectedTrack ? ' ◀' : ''}</span>
+      <span class="ctl"><label>vol <input id="t${t}-vol" type="range" min="0" max="2" step="0.01" value="${m.volume}" oninput="setTrackVolume(${t}, this.value)"></label>
+        <span class="val" id="t${t}-vol-val">${m.volume.toFixed(2)}</span></span>
+      <span class="ctl"><label>pan <input id="t${t}-pan" type="range" min="-1" max="1" step="0.05" value="${m.pan}" oninput="setTrackPan(${t}, this.value)"></label>
+        <span class="val" id="t${t}-pan-val">${m.pan.toFixed(2)}</span></span>
+      <button id="t${t}-mute" class="${m.mute ? 'toggled' : ''}" onclick="toggleMute(${t})">M</button>
+      <button id="t${t}-solo" class="${m.solo ? 'toggled' : ''}" onclick="toggleSolo(${t})">S</button>
+      <span class="status" style="margin-left:auto;font-size:11px">${trackNotes[t].length} notes</span>`;
+    host.appendChild(div);
+  }
+}
+
+function updateUI() {
+  const started = audioRunning && engineReady;
+  for (const id of ['btn-play', 'btn-stop', 'btn-clear']) document.getElementById(id).disabled = !started;
+  document.getElementById('st-tracks').textContent = `tracks: ${numTracks}`;
+  document.getElementById('st-rebuilds').textContent = `rebuilds: ${rebuilds}`;
+  document.getElementById('st-sounds').textContent = 'sounds: ' + (numTracks * (PITCH_HIGH - PITCH_LOW + 1));
+  setStatus(engineReady ? 'ready' : (audioRunning ? 'engine failed' : 'idle'));
+  renderTrackList();
+}
+
+renderTrackList();
+renderEqPanel();
+updateUI();
+drawRoll();
+
+// ============================================================================
+// Test / automation API — the browser test drives the SAME paths as the UI
+// (no test-only backdoors into the engine).
+// ============================================================================
+window.__phase10 = {
+  // LIGHT position read for high-rate polling — the state getter rebuilds
+  // the notes/mixer/EQ arrays on every access; polling it starves the page's
+  // pump (which freezes the readout — the engine keeps playing fine).
+  pos() { return lastPosition; },
+  get state() {
+    return {
+      audioRunning, engineReady, isPlaying, bpm, position: lastPosition,
+      rebuilds, numTracks, selectedTrack,
+      masterLevel: lastLevel,
+      trackNotes: trackNotes.map((a) => a.map((n) => ({ ...n }))),
+      trackMixer: trackMixer.map((m) => ({ ...m })),
+      trackEQ: trackEQ.map((a) => a.map((b) => ({ ...b }))),
+    };
+  },
+  startAudio: () => window.startAudio(),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (sec) => window.seek(sec),
+  setBpm: (v) => window.setBpm(v),
+  setMaster: (v) => window.setMaster(v),
+  selectTrack: (t) => window.selectTrack(t),
+  setTrackVolume: (t, v) => window.setTrackVolume(t, v),
+  setTrackPan: (t, v) => window.setTrackPan(t, v),
+  toggleMute: (t) => window.toggleMute(t),
+  toggleSolo: (t) => window.toggleSolo(t),
+  clearSelected: () => window.clearSelected(),
+  rebuildEngine: (reason) => rebuildEngine(reason || 'api'),
+  // Phase 10 EQ surface (band: 0/1/2; param: 0 freq / 1 gain / 2 Q)
+  setEqBand: (t, band, freq, gain, q) => {
+    trackEQ[t][band] = { freq: +freq, gain: +gain, q: +q };
+    post({ type: 'set-eq-band', trackId: t, band, freq: +freq, gain: +gain, q: +q });
+    if (t === selectedTrack) renderEqPanel();
+  },
+  setEqParam: (band, param, v) => window.setEqParam(band, param, v),
+  setEqFlat: (t) => {
+    const tt = (t === undefined) ? selectedTrack : t;
+    for (let b = 0; b < 3; b++) {
+      trackEQ[tt][b].gain = 0;
+      post({ type: 'set-eq-band', trackId: tt, band: b,
+             freq: trackEQ[tt][b].freq, gain: 0, q: trackEQ[tt][b].q });
+    }
+    if (tt === selectedTrack) renderEqPanel();
+  },
+  addEq: (t) => post({ type: 'add-eq', trackId: t }),
+  hasEq: (t) => new Promise((resolve) => {
+    const onMsg = (e) => {
+      if (e.data && e.data.type === 'eq-status' && e.data.trackId === (t | 0)) {
+        workletNode.port.removeEventListener('message', onMsg);
+        resolve(e.data.hasEQ === 1 || e.data.hasEQ === true);
+      }
+    };
+    workletNode.port.addEventListener('message', onMsg);
+    post({ type: 'has-eq', trackId: t });
+    setTimeout(() => { workletNode.port.removeEventListener('message', onMsg); resolve(null); }, 3000);
+  }),
+  noteOn: (p, v) => post({ type: 'note-on', note: p, velocity: v || 100 }),
+  noteOff: (p) => post({ type: 'note-off', note: p }),
+  // Audio verification taps (main-thread AnalyserNode on the worklet output):
+  getDominantFreq() {
+    if (!analyser) return null;
+    const data = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(data);
+    let best = -Infinity, idx = -1;
+    for (let i = 2; i < data.length; i++) if (data[i] > best) { best = data[i]; idx = i; }
+    if (idx < 0) return null;
+    return (idx * analyser.context.sampleRate) / analyser.fftSize;
+  },
+  getRms() {
+    if (!analyser) return null;
+    const data = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(data);
+    let s = 0;
+    for (let i = 0; i < data.length; i++) s += data[i] * data[i];
+    return Math.sqrt(s / data.length);
+  },
+  // Structural regression guard (PR #4 review): the measurement-tap
+  // contract — smoothingTimeConstant MUST be 0 (the default 0.8 makes
+  // dominant-frequency attribution lag ~0.5s behind the audio; found by
+  // the phase 10 spectral-flip browser checks). The test asserts this
+  // so a future refactor of the analyser setup fails loud, not by
+  // margin.
+  get analyserConfig() {
+    return analyser
+      ? { fftSize: analyser.fftSize, smoothingTimeConstant: analyser.smoothingTimeConstant }
+      : null;
+  },
+};
+</script>
+</body>
+</html>

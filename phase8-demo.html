@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 8 — Piano Roll Sequencer (Tracktion engine, WASM)</title>
+<!--
+  Phase 8 demo: draw notes in a piano roll → press play → they play back
+  through the Phase 7 SFZ sampler (WasmSamplerPlugin), quantum-accurately
+  (scheduled at exact sample positions; onsets render block-quantized, ≤ one
+  128-sample quantum ≈ 2.7ms), entirely inside the WASM engine. Transport
+  with play/stop/seek, BPM control, on-screen keyboard for live audition.
+
+  Architecture (all the Phase 6 AudioWorklet fixes apply — see
+  public/wasm/phase5-processor.js):
+    page ──postMessage──▶ phase5-processor (worklet, instrument:'sampler')
+                              └── WASM engine: transport → MidiClip →
+                                  WasmSamplerPlugin → HostedAudioDevice
+  The page owns the note state (JS); the engine owns playback. Note
+  removals / BPM re-flow / clear trigger a full engine REBUILD (worklet
+  re-instantiates the WASM module — engine_create is idempotent with no
+  sequence-reset export); the page re-applies its state after 'ready'.
+  Additions are pushed incrementally (add-midi-note).
+
+  A window.__phase8 API mirrors every UI action for the browser test
+  (test_phase8_browser.py drives the SAME code paths — no test-only
+  backdoors into the engine).
+-->
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: #14161d; color: #d7dae3; padding: 16px;
+  }
+  h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+  .subtitle { font-size: 12px; color: #8a90a4; margin-bottom: 12px; }
+  .error {
+    background: #3a1520; color: #ff8ba0; border: 1px solid #7a2a44;
+    padding: 8px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 10px;
+    white-space: pre-wrap; font-family: monospace;
+  }
+  .panel {
+    background: #1c1f29; border: 1px solid #2c3040; border-radius: 8px;
+    padding: 12px; margin-bottom: 12px;
+  }
+  .status-grid { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; }
+  .status-grid .label { color: #7c8296; }
+  .transport { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button {
+    background: #2a2f3f; color: #d7dae3; border: 1px solid #3a4056;
+    padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #343a4e; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.btn-play { background: #1d5c3f; border-color: #2a7a55; }
+  button.btn-play:hover:not(:disabled) { background: #24704e; }
+  button.btn-stop { background: #5c1d1d; border-color: #7a2a2a; }
+  button.btn-erase.active { background: #6b4a1d; border-color: #a0722a; }
+  .bpm-box { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .bpm-box input[type=range] { width: 140px; }
+  .roll-wrap { display: flex; gap: 0; border: 1px solid #2c3040; border-radius: 8px; overflow: hidden; }
+  .kb-col { background: #191c25; }
+  .roll-scroll { overflow-x: auto; flex: 1; }
+  #roll { display: block; background: #171a22; cursor: crosshair; }
+  .logs-box {
+    background: #12141b; border: 1px solid #23262f; border-radius: 6px;
+    padding: 8px 10px; font-family: monospace; font-size: 11px;
+    color: #8a90a4; height: 130px; overflow-y: auto; white-space: pre-wrap;
+  }
+  .hint { font-size: 11px; color: #7c8296; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Phase 8 — Piano Roll Sequencer</h1>
+<div class="subtitle">Tracktion engine in WASM · SFZ sampler (Phase 7) · quantum-accurate scheduled playback · zero WebAudio nodes for synthesis</div>
+
+<div id="error-box" style="display:none;" class="error"></div>
+
+<div class="panel">
+  <div class="status-grid">
+    <div><span class="label">Audio:</span> <span id="audio-status">⚪ stopped</span></div>
+    <div><span class="label">Engine:</span> <span id="engine-status">⚪ not created</span></div>
+    <div><span class="label">Instrument:</span> <span id="instrument-status">⚪ —</span></div>
+    <div><span class="label">Sounds:</span> <span id="sounds-status">⚪ 0</span></div>
+    <div><span class="label">Playing:</span> <span id="playing-status">⚪ no</span></div>
+    <div><span class="label">Position:</span> <span id="position-status">0.00s</span></div>
+    <div><span class="label">BPM:</span> <span id="bpm-status">120</span></div>
+    <div><span class="label">Notes:</span> <span id="notes-status">0</span></div>
+    <div><span class="label">Rebuilds:</span> <span id="rebuilds-status">0</span></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="transport">
+    <button id="btn-start" class="btn-play" onclick="startAudio()">Start Audio</button>
+    <button id="btn-play" onclick="play()" disabled>▶ Play</button>
+    <button id="btn-stop" class="btn-stop" onclick="stop()" disabled>⏹ Stop</button>
+    <button id="btn-erase" onclick="toggleErase()" disabled>⌫ Erase mode</button>
+    <button id="btn-clear" onclick="clearAll()" disabled>Clear all</button>
+    <div class="bpm-box">
+      <label>BPM: <span id="bpm-display">120</span></label>
+      <input type="range" id="bpm-slider" min="60" max="200" value="120" oninput="setBpm(this.value)" disabled>
+    </div>
+  </div>
+  <div class="hint">Draw: click/drag on the grid (drag right = longer note, snaps to 1/4 beat) · Right-click = erase that note · Click the ruler to seek · On-screen keyboard (left) = live audition. Sound samples are synthesized in-page and loaded into the engine sampler; notes longer than 1s truncate at the sample end (PoC).</div>
+</div>
+
+<div class="panel">
+  <div class="roll-wrap">
+    <div class="kb-col"><canvas id="kb"></canvas></div>
+    <div class="roll-scroll"><canvas id="roll"></canvas></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div id="logs" class="logs-box">(no activity yet)</div>
+</div>
+
+<script type="module">
+// ============================================================================
+// State
+// ============================================================================
+const SAMPLE_RATE = 48000;
+const BPM_DEFAULT = 120;
+const BEATS = 16;              // timeline length (one clip, beats 0-16)
+const BEAT_PX = 72;             // horizontal resolution
+const SUBDIV = 4;               // 1/4-beat snap (16th notes)
+const PITCH_LOW = 48;           // C3
+const PITCH_HIGH = 72;          // C5
+const ROWS = PITCH_HIGH - PITCH_LOW + 1;
+const ROW_PX = 18;
+const RULER_PX = 22;
+
+let audioCtx = null;
+let workletNode = null;
+let analyser = null;           // main-thread tap for pitch/RMS verification
+let audioRunning = false;
+let engineReady = false;
+let instrumentReady = false;
+let numSounds = 0;
+let isPlaying = false;
+let bpm = BPM_DEFAULT;
+let eraseMode = false;
+let rebuilds = 0;
+let lastPosition = 0;
+let lastPositionAt = 0;        // performance.now() of last position report
+
+// The piano-roll state: THE source of truth (the engine's clip is append-
+// only; deletions rebuild the engine and re-apply this).
+const notes = [];              // { pitch, vel, start, len } in beats
+let dirty = false;             // notes changed since last engine apply?
+let dragNote = null;           // { pitch, start, len } while dragging
+
+const Ctor = window.AudioContext || window.webkitAudioContext;
+
+// ============================================================================
+// Sound synthesis (in-page "SFZ instrument": one decaying-harmonic sine per
+// key, mono float32 — pushed into the engine's WasmSamplerPlugin)
+// ============================================================================
+function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+function synthSound(note, amp, numFrames, sampleRate) {
+  const f = midiToFreq(note);
+  const out = new Float32Array(numFrames);
+  for (let i = 0; i < numFrames; i++) {
+    const t = i / sampleRate;
+    const env = Math.exp(-t * 2.2);
+    out[i] = amp * env * (Math.sin(2 * Math.PI * f * t) + 0.25 * Math.sin(4 * Math.PI * f * t));
+  }
+  return out;
+}
+const SOUND_FRAMES = 48000; // 1.0s
+const SOUND_AMP = 0.25;
+
+// ============================================================================
+// Worklet plumbing
+// ============================================================================
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+let readyResolver = null;
+function awaitReady(timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('awaitReady timeout')), timeoutMs);
+    readyResolver = (msg) => { clearTimeout(timer); readyResolver = null; resolve(msg); };
+  });
+}
+
+function log(msg) {
+  const box = document.getElementById('logs');
+  const lines = box.textContent.split('\n').filter((l) => l.trim());
+  lines.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
+  box.textContent = lines.slice(-14).join('\n');
+  box.scrollTop = box.scrollHeight;
+}
+function setError(msg) {
+  const box = document.getElementById('error-box');
+  if (msg) { box.textContent = '⚠️ ' + msg; box.style.display = 'block'; }
+  else box.style.display = 'none';
+}
+
+// The instrument sounds (cached for re-apply after rebuilds).
+const soundCache = new Map(); // pitch -> Float32Array
+function soundFor(pitch) {
+  if (!soundCache.has(pitch)) {
+    soundCache.set(pitch, synthSound(pitch, SOUND_AMP, SOUND_FRAMES, SAMPLE_RATE));
+  }
+  return soundCache.get(pitch);
+}
+
+// Push the page's full state into the (fresh) engine.
+async function applyStateToEngine() {
+  post({ type: 'set-bpm', bpm });
+  for (let p = PITCH_LOW; p <= PITCH_HIGH; p++) {
+    post({
+      type: 'sampler-load-sound', rootNote: p, minNote: p, maxNote: p,
+      minVel: 1, maxVel: 127, data: soundFor(p),
+      numFrames: SOUND_FRAMES, numChannels: 1, sampleRate: SAMPLE_RATE,
+    });
+  }
+  // ALWAYS create the MIDI clip, even when there are no notes yet (review
+  // fix — the P1 "draw after Clear all is silently dropped" bug): the
+  // incremental addNote path posts add-midi-note, which returns -2 and
+  // warns when no clip exists. An empty clip is harmless; a missing clip
+  // breaks every note drawn after an empty-state rebuild.
+  post({ type: 'add-midi-clip', startBeat: 0, lengthBeats: BEATS });
+  for (const n of notes) {
+    post({ type: 'add-midi-note', pitch: n.pitch, velocity: n.vel, startBeat: n.start, lengthBeats: n.len });
+  }
+  dirty = false;
+}
+
+// Full engine reset (deletions / BPM re-flow / clear). Waits for the new
+// 'ready' and re-applies state.
+async function rebuildEngine(reason) {
+  if (!engineReady) return;
+  log(`rebuild-engine (${reason})…`);
+  rebuilds++;
+  engineReady = false;
+  instrumentReady = false;
+  post({ type: 'rebuild-engine' });
+  const msg = await awaitReady();
+  engineReady = msg.engineCreated === true;
+  instrumentReady = msg.sampler === true;
+  if (engineReady) await applyStateToEngine();
+  updateUI();
+  log(`rebuild done: engine=${engineReady} sampler=${instrumentReady}`);
+}
+
+// ============================================================================
+// Audio startup
+// ============================================================================
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setError(null);
+    log('Creating AudioContext…');
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    log('AudioWorklet loaded');
+
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    workletNode.connect(audioCtx.destination);
+
+    workletNode.port.onmessage = (e) => { handleWorkletMessage(e.data); };
+
+    log('Fetching WASM binary…');
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm');
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`WASM fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+
+    const readyPromise = awaitReady();
+    workletNode.port.postMessage(
+      { type: 'init-wasm', wasmBinary, instrument: 'sampler' }, [wasmBinary]);
+    const msg = await readyPromise;
+    engineReady = msg.engineCreated === true;
+    instrumentReady = msg.sampler === true;
+
+    if (engineReady && instrumentReady) {
+      await applyStateToEngine();
+      log(`Engine ready — sampler armed, ${PITCH_HIGH - PITCH_LOW + 1} sounds queued`);
+    } else {
+      setError(`engine not ready (created=${msg.engineCreated} sampler=${msg.sampler})`);
+    }
+
+    // Periodic pump between quanta (see phase5-processor R8 note) + keeps
+    // the deferred live-input retry flowing.
+    setInterval(() => { post({ type: 'pump' }); }, 100);
+
+    audioRunning = true;
+    updateUI();
+    log('Audio running');
+  } catch (e) {
+    setError(e.message);
+    log(`Error: ${e.message}`);
+  }
+};
+
+function handleWorkletMessage(msg) {
+  if (msg.type === 'ready') {
+    if (readyResolver) readyResolver(msg);
+    else { engineReady = msg.engineCreated === true; instrumentReady = msg.sampler === true; updateUI(); }
+  } else if (msg.type === 'position') {
+    lastPosition = msg.position;
+    lastPositionAt = performance.now();
+    const wasPlaying = isPlaying;
+    isPlaying = msg.isPlaying === true || msg.isPlaying === 1;
+    if (wasPlaying && !isPlaying) log('playback ended (transport stopped)');
+    updateUI();
+  } else if (msg.type === 'sampler-sound-loaded') {
+    if (msg.numSounds !== numSounds) {
+      numSounds = msg.numSounds;
+      updateUI();
+    }
+  } else if (msg.type === 'sampler-status') {
+    numSounds = msg.numSounds;
+    updateUI();
+  } else if (msg.type === 'error') {
+    setError(msg.error);
+    log(`Error: ${msg.error}`);
+  } else if (msg.type === 'warn') {
+    log(`warn: ${msg.message}`);
+  }
+}
+
+// ============================================================================
+// Transport + BPM
+// ============================================================================
+window.play = function () {
+  if (!engineReady) { log('Engine not ready'); return; }
+  if (dirty) { rebuildEngine('apply pending edits').then(() => { post({ type: 'transport-play' }); }); return; }
+  post({ type: 'transport-play' });
+  log('play — transport running');
+};
+window.stop = function () {
+  post({ type: 'transport-stop' });
+  log('stop');
+};
+window.seek = function (seconds) {
+  post({ type: 'seek', seconds: Math.max(0, seconds) });
+  lastPosition = Math.max(0, seconds);
+  lastPositionAt = performance.now();
+  updateUI();
+};
+window.setBpm = function (val) {
+  const newBpm = parseInt(val, 10);
+  if (newBpm === bpm) return;
+  bpm = newBpm;
+  if (audioRunning && engineReady) {
+    // BPM must be set BEFORE the clip is (re)inserted for the time mapping
+    // to re-flow — full rebuild keeps the grid ↔ timeline mapping honest.
+    rebuildEngine(`bpm ${newBpm}`).then(() => log(`BPM now ${bpm} (engine re-flowed)`));
+  } else {
+    post({ type: 'set-bpm', bpm });
+  }
+  updateUI();
+};
+window.toggleErase = function () {
+  eraseMode = !eraseMode;
+  document.getElementById('btn-erase').classList.toggle('active', eraseMode);
+  document.getElementById('roll').style.cursor = eraseMode ? 'not-allowed' : 'crosshair';
+};
+window.clearAll = function () {
+  if (notes.length === 0) return;
+  notes.length = 0;
+  dirty = true;
+  drawRoll();
+  updateUI();
+  if (engineReady) rebuildEngine('clear all');
+  log('cleared all notes');
+};
+
+// ============================================================================
+// Note model operations (the ONLY paths the UI and the test API share)
+// ============================================================================
+function addNote(pitch, start, len, vel = 100) {
+  pitch = Math.max(PITCH_LOW, Math.min(PITCH_HIGH, Math.round(pitch)));
+  start = Math.max(0, Math.min(BEATS - 0.25, start));
+  len = Math.max(0.25, Math.min(BEATS - start, len));
+  const note = { pitch, vel, start, len };
+  notes.push(note);
+  if (engineReady && !dirty) {
+    // incremental path: the clip already exists on the engine (created on
+    // the first note of this engine generation)
+    post({ type: 'add-midi-note', pitch, velocity: vel, startBeat: start, lengthBeats: len });
+  } else {
+    dirty = true; // will be applied on next play/rebuild
+  }
+  drawRoll();
+  updateUI();
+  return note;
+}
+
+function eraseNoteAt(pitch, startBeat) {
+  const idx = notes.findIndex((n) =>
+    n.pitch === pitch && startBeat >= n.start - 0.01 && startBeat < n.start + n.len + 0.01);
+  if (idx === -1) return false;
+  notes.splice(idx, 1);
+  dirty = true;
+  drawRoll();
+  updateUI();
+  if (engineReady) rebuildEngine(`erase note ${pitch}`);
+  return true;
+}
+
+// ============================================================================
+// Piano roll canvas
+// ============================================================================
+const rollCanvas = document.getElementById('roll');
+const rollCtx = rollCanvas.getContext('2d');
+const kbCanvas = document.getElementById('kb');
+const kbCtx = kbCanvas.getContext('2d');
+
+function pitchToRow(p) { return PITCH_HIGH - p; } // top = high pitch
+function rowToPitch(r) { return PITCH_HIGH - r; }
+
+function isBlackKey(p) { return [1, 3, 6, 8, 10].includes(((p % 12) + 12) % 12); }
+function keyName(p) {
+  const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  return NAMES[p % 12] + (Math.floor(p / 12) - 1);
+}
+
+function setupCanvases() {
+  const width = BEATS * BEAT_PX;
+  const height = RULER_PX + ROWS * ROW_PX;
+  rollCanvas.width = width; rollCanvas.height = height;
+  kbCanvas.width = 56; kbCanvas.height = height;
+  drawKeyboard();
+}
+
+function drawKeyboard() {
+  kbCtx.clearRect(0, 0, kbCanvas.width, kbCanvas.height);
+  for (let r = 0; r < ROWS; r++) {
+    const p = rowToPitch(r);
+    const y = RULER_PX + r * ROW_PX;
+    kbCtx.fillStyle = isBlackKey(p) ? '#22252f' : '#e8e9ee';
+    kbCtx.fillRect(0, y + 1, kbCanvas.width - 6, ROW_PX - 2);
+    kbCtx.fillStyle = isBlackKey(p) ? '#7c8296' : '#333';
+    kbCtx.font = '9px monospace';
+    if (p % 12 === 0) kbCtx.fillText(keyName(p), 4, y + 13);
+  }
+}
+
+function drawRoll() {
+  const W = rollCanvas.width, H = rollCanvas.height;
+  rollCtx.clearRect(0, 0, W, H);
+
+  // rows: black-key shading + octave lines
+  for (let r = 0; r < ROWS; r++) {
+    const p = rowToPitch(r);
+    const y = RULER_PX + r * ROW_PX;
+    if (isBlackKey(p)) { rollCtx.fillStyle = '#141620'; rollCtx.fillRect(0, y, W, ROW_PX); }
+    if (p % 12 === 0) { rollCtx.strokeStyle = '#2c3145'; rollCtx.beginPath(); rollCtx.moveTo(0, y); rollCtx.lineTo(W, y); rollCtx.stroke(); }
+  }
+  // beat grid
+  for (let b = 0; b <= BEATS; b++) {
+    const x = b * BEAT_PX;
+    rollCtx.strokeStyle = b % 4 === 0 ? '#333a52' : '#20232e';
+    rollCtx.beginPath(); rollCtx.moveTo(x, RULER_PX); rollCtx.lineTo(x, H); rollCtx.stroke();
+  }
+  // subdivisions (1/4 beat)
+  rollCtx.strokeStyle = '#1a1d26';
+  for (let b = 0; b < BEATS * SUBDIV; b++) {
+    const x = b * (BEAT_PX / SUBDIV);
+    if (b % SUBDIV !== 0) { rollCtx.beginPath(); rollCtx.moveTo(x, RULER_PX); rollCtx.lineTo(x, H); rollCtx.stroke(); }
+  }
+  // ruler
+  rollCtx.fillStyle = '#191c25';
+  rollCtx.fillRect(0, 0, W, RULER_PX);
+  rollCtx.fillStyle = '#7c8296';
+  rollCtx.font = '10px monospace';
+  for (let b = 0; b < BEATS; b += 4) rollCtx.fillText(String(b + 1), b * BEAT_PX + 3, 14);
+
+  // notes
+  const drawNoteRect = (n, preview) => {
+    const x = n.start * BEAT_PX;
+    const y = RULER_PX + pitchToRow(n.pitch) * ROW_PX;
+    const w = n.len * BEAT_PX;
+    const hue = 200 - (n.pitch - PITCH_LOW) * 4;
+    rollCtx.fillStyle = preview ? `hsla(${hue}, 60%, 55%, 0.55)` : `hsl(${hue}, 55%, 45%)`;
+    rollCtx.fillRect(x + 1, y + 2, w - 2, ROW_PX - 4);
+    rollCtx.strokeStyle = preview ? `hsl(${hue}, 60%, 70%)` : `hsl(${hue}, 55%, 65%)`;
+    rollCtx.strokeRect(x + 1, y + 2, w - 2, ROW_PX - 4);
+  };
+  for (const n of notes) drawNoteRect(n, false);
+  if (dragNote) drawNoteRect(dragNote, true);
+}
+
+// Playhead: interpolate between the worklet's ~133ms position reports.
+function drawPlayhead() {
+  if (!isPlaying) return;
+  const secPerBeat = 60 / bpm;
+  const elapsed = (performance.now() - lastPositionAt) / 1000;
+  const pos = lastPosition + elapsed;
+  const x = (pos / secPerBeat) * BEAT_PX;
+  const W = rollCanvas.width;
+  if (x >= 0 && x <= W) {
+    drawRoll();
+    rollCtx.strokeStyle = '#ff5d5d';
+    rollCtx.lineWidth = 2;
+    rollCtx.beginPath(); rollCtx.moveTo(x, RULER_PX); rollCtx.lineTo(x, rollCanvas.height); rollCtx.stroke();
+    rollCtx.lineWidth = 1;
+  }
+  if (pos / secPerBeat > BEATS + 1) stop();
+}
+
+// --- Interaction ---
+function rollEventToCell(evt) {
+  const rect = rollCanvas.getBoundingClientRect();
+  const x = evt.clientX - rect.left;
+  const y = evt.clientY - rect.top;
+  const beat = Math.floor((x / BEAT_PX) * SUBDIV) / SUBDIV; // snap 1/4
+  const row = Math.floor((y - RULER_PX) / ROW_PX);
+  return { beat, row, inRuler: y < RULER_PX, y, x };
+}
+
+let dragging = false;
+rollCanvas.addEventListener('mousedown', (evt) => {
+  if (evt.button === 2) return; // contextmenu path handles erase
+  const cell = rollEventToCell(evt);
+  if (cell.inRuler) { seek(cell.beat * 60 / bpm); return; }
+  if (!audioRunning) { log('Start audio first'); return; }
+  if (eraseMode) { eraseNoteAt(rowToPitch(cell.row), cell.beat); return; }
+  dragging = true;
+  dragNote = { pitch: rowToPitch(cell.row), start: cell.beat, len: 1 / SUBDIV, vel: 100 };
+  drawRoll();
+});
+rollCanvas.addEventListener('mousemove', (evt) => {
+  const cell = rollEventToCell(evt);
+  if (dragging && dragNote) {
+    dragNote.len = Math.max(1 / SUBDIV, Math.min(BEATS - dragNote.start, cell.beat - dragNote.start + 1 / SUBDIV));
+    drawRoll();
+  }
+});
+window.addEventListener('mouseup', () => {
+  if (dragging && dragNote) {
+    const { pitch, start, len, vel } = dragNote;
+    dragNote = null; dragging = false;
+    addNote(pitch, start, len, vel);
+  }
+});
+rollCanvas.addEventListener('contextmenu', (evt) => {
+  evt.preventDefault();
+  const cell = rollEventToCell(evt);
+  if (!cell.inRuler) eraseNoteAt(rowToPitch(cell.row), cell.beat);
+});
+
+// On-screen keyboard: live audition (hosted MIDI → sampler).
+const activeKeys = new Set();
+kbCanvas.addEventListener('mousedown', (evt) => {
+  const rect = kbCanvas.getBoundingClientRect();
+  const row = Math.floor((evt.clientY - rect.top - RULER_PX) / ROW_PX);
+  const p = rowToPitch(row);
+  if (p < PITCH_LOW || p > PITCH_HIGH) return;
+  activeKeys.add(p);
+  post({ type: 'note-on', note: p, velocity: 100 });
+});
+window.addEventListener('mouseup', () => {
+  for (const p of activeKeys) post({ type: 'note-off', note: p });
+  activeKeys.clear();
+});
+
+// ============================================================================
+// UI state
+// ============================================================================
+function updateUI() {
+  document.getElementById('audio-status').textContent = audioRunning ? '🟢 running' : '⚪ stopped';
+  document.getElementById('engine-status').textContent = engineReady ? '🟢 created' : '⚪ not created';
+  document.getElementById('instrument-status').textContent = instrumentReady ? '🟢 SFZ sampler' : '⚪ —';
+  document.getElementById('sounds-status').textContent = `⚪ ${numSounds}`;
+  document.getElementById('playing-status').textContent = isPlaying ? '🔴 yes' : '⚪ no';
+  document.getElementById('position-status').textContent = lastPosition.toFixed(2) + 's';
+  document.getElementById('bpm-status').textContent = bpm;
+  document.getElementById('bpm-display').textContent = bpm;
+  document.getElementById('notes-status').textContent = String(notes.length);
+  document.getElementById('rebuilds-status').textContent = String(rebuilds);
+
+  document.getElementById('btn-start').textContent = audioRunning ? '✓ Audio running' : 'Start Audio';
+  document.getElementById('btn-start').disabled = audioRunning;
+  document.getElementById('btn-play').disabled = !engineReady || isPlaying;
+  document.getElementById('btn-stop').disabled = !isPlaying;
+  document.getElementById('btn-erase').disabled = !audioRunning;
+  document.getElementById('btn-clear').disabled = !audioRunning || notes.length === 0;
+  document.getElementById('bpm-slider').disabled = !audioRunning;
+}
+
+// Playhead animation loop
+function frame() {
+  if (isPlaying) drawPlayhead();
+  else if (lastPosition > 0) { /* keep last drawn state */ }
+  requestAnimationFrame(frame);
+}
+
+// ============================================================================
+// Test / automation API — the browser test drives the SAME paths as the UI.
+// ============================================================================
+window.__phase8 = {
+  get state() {
+    return {
+      audioRunning, engineReady, instrumentReady, numSounds, isPlaying,
+      bpm, position: lastPosition, rebuilds,
+      notes: notes.map((n) => ({ ...n })),
+    };
+  },
+  addNote: (pitch, start, len, vel) => addNote(pitch, start, len, vel || 100),
+  eraseNoteAt: (pitch, startBeat) => eraseNoteAt(pitch, startBeat),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (sec) => window.seek(sec),
+  setBpm: (v) => window.setBpm(v),
+  startAudio: () => window.startAudio(),
+  rebuildEngine: (reason) => rebuildEngine(reason || 'api'),
+  // Audio verification taps (main-thread AnalyserNode on the worklet output):
+  getDominantFreq() {
+    if (!analyser) return null;
+    const data = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(data);
+    let best = -Infinity, idx = -1;
+    for (let i = 2; i < data.length; i++) if (data[i] > best) { best = data[i]; idx = i; }
+    if (idx < 0) return null;
+    return (idx * analyser.context.sampleRate) / analyser.fftSize;
+  },
+  getRms() {
+    if (!analyser) return null;
+    const data = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(data);
+    let s = 0;
+    for (let i = 0; i < data.length; i++) s += data[i] * data[i];
+    return Math.sqrt(s / data.length);
+  },
+};
+
+// ============================================================================
+// Init
+// ============================================================================
+setupCanvases();
+drawRoll();
+updateUI();
+requestAnimationFrame(frame);
+log('Piano roll ready — click "Start Audio" to begin');
+
+// Preload a small demo melody so the page is immediately playable.
+function seedDemoMelody() {
+  const demo = [
+    { pitch: 60, start: 1, len: 1 }, { pitch: 64, start: 3, len: 1 },
+    { pitch: 67, start: 5, len: 1 }, { pitch: 72, start: 7, len: 1 },
+    { pitch: 71, start: 9, len: 0.5 }, { pitch: 67, start: 9.5, len: 0.5 },
+    { pitch: 64, start: 10, len: 1 }, { pitch: 60, start: 12, len: 2 },
+  ];
+  for (const d of demo) addNote(d.pitch, d.start, d.len, 100);
+  log(`seeded demo melody (${notes.length} notes) — press Play`);
+}
+seedDemoMelody();
+</script>
+</body>
+</html>

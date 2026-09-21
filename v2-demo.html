@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V2 Validation Demo — Tracktion engine (wasm + AudioWorklet)</title>
+<link rel="stylesheet" href="/v2-demo.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════ TOP BAR (spec §7.1) ═══════════════════ -->
+<header id="topbar">
+  <div class="brand">
+    <span class="logo">▦</span>
+    <span class="title">Tracktion&nbsp;WASM <em>V2 validation demo</em></span>
+    <span id="status-pill" class="pill pill-idle">idle</span>
+    <span id="status-detail" class="detail"></span>
+  </div>
+
+  <div class="transport">
+    <button id="btn-boot"   class="tb tb-accent">1 · Boot engine</button>
+    <button id="btn-build"  class="tb"           disabled>2 · Build arrangement</button>
+    <button id="btn-play"   class="tb tb-play"   disabled title="Space">▶ Play</button>
+    <button id="btn-stop"   class="tb tb-stop"   disabled>■ Stop</button>
+    <button id="btn-undo"   class="tb"           disabled title="Undo (stopped)">↶</button>
+    <button id="btn-redo"   class="tb"           disabled title="Redo (stopped)">↷</button>
+  </div>
+
+  <div class="readout">
+    <span id="pos-display" class="pos">bar 1.1</span>
+    <span id="pos-sec" class="pos-sec">0.00 s</span>
+    <label class="bpm-box" title="BPM changes are STOPPED-ONLY: the remapping semantics move MIDI vs wave content (spec §6.15).">
+      BPM <input id="bpm-input" type="number" min="40" max="240" step="1" value="100" disabled>
+    </label>
+  </div>
+
+  <div class="master-box" title="Master fader (LIVE). Meter = the engine's own master level (read-and-clear stream).">
+    <span class="mb-label">MASTER</span>
+    <input id="master-vol" type="range" min="-40" max="6" step="0.5" value="0" disabled>
+    <span id="master-vol-v" class="mb-val">0.0 dB</span>
+    <canvas id="master-meter" width="72" height="14"></canvas>
+  </div>
+</header>
+
+<!-- ═════════════════════ MAIN: TIMELINE + KEYBOARD RAIL (§7.2/7.3) ═════ -->
+<main id="main">
+  <section id="timeline">
+    <div id="tl-head">
+      <span class="tl-corner">TRACKS</span>
+      <div id="ruler"><canvas id="ruler-canvas"></canvas></div>
+    </div>
+    <div id="tl-body">
+      <div id="gutter"><!-- lane labels injected by JS --></div>
+      <div id="lanes"><!-- one canvas per lane + the playhead overlay, injected by JS --></div>
+    </div>
+  </section>
+
+  <aside id="rail">
+    <div class="rail-title">LIVE INPUT</div>
+    <div class="rail-row">
+      <label>target</label>
+      <select id="kb-target" disabled>
+        <option value="1" selected>Keys (sfizz EP)</option>
+        <option value="2">Bass (sfizz)</option>
+      </select>
+    </div>
+    <div class="rail-row">
+      <label>octave</label>
+      <button id="kb-oct-down" class="tb tb-mini" disabled>−</button>
+      <span id="kb-oct" class="kb-oct">C4</span>
+      <button id="kb-oct-up" class="tb tb-mini" disabled>+</button>
+    </div>
+    <div id="keys"><!-- piano keys injected by JS --></div>
+    <div class="rail-hint">keys <b>a w s e d f t g y h u j k</b> · octave <b>z / x</b><br>
+      pointer or keyboard — routes live MIDI to the target track (needs the arrangement built; audio may require a prior click anywhere on the page).</div>
+  </aside>
+</main>
+
+<!-- ═══════════════════════════ BOTTOM TABS (§7.4) ══════════════════════ -->
+<nav id="tabs">
+  <button class="tab tab-active" data-tab="inspector">Inspector</button>
+  <button class="tab" data-tab="mixer">Mixer</button>
+  <button class="tab" data-tab="analysis">Analysis</button>
+  <button class="tab" data-tab="verify">Verify</button>
+  <button class="tab" data-tab="about">About</button>
+</nav>
+
+<section id="tab-panels">
+
+  <!-- ── Inspector ─────────────────────────────────────────────────── -->
+  <div class="panel panel-active" id="tab-inspector">
+    <div id="insp-empty" class="insp-empty">Select a clip in the timeline (click a Drums wave clip or a Keys/Bass MIDI clip) — the Inspector binds to it.</div>
+    <div id="insp-clip" class="insp-clip" hidden>
+      <div class="insp-head">
+        <span id="insp-title">clip</span>
+        <span id="insp-kind" class="chip"></span>
+      </div>
+
+      <div class="insp-grid">
+        <label title="Clip gain — STOPPED-ONLY in this UI: the live write class shows a restart sawtooth (the §6g.4 recorded divergence).">gain dB
+          <span class="stop-flag">stopped</span></label>
+        <input id="insp-gain" type="range" min="-30" max="12" step="0.5" value="0">
+        <span id="insp-gain-v" class="val">0.0</span>
+
+        <label title="Clip pan (LIVE per block). NOTE: pan is a no-op on a MONO-source node (WaveNode.cpp) — the drum sections are stereo.">pan</label>
+        <input id="insp-pan" type="range" min="-1" max="1" step="0.05" value="0">
+        <span id="insp-pan-v" class="val">0.00</span>
+
+        <label title="Fade-in/out (STOPPED-ONLY: the fades are baked into the node at graph build; fadeIn+fadeOut must stay ≤ the clip length).">fades s
+          <span class="stop-flag">stopped</span></label>
+        <div class="fade-pair">
+          <input id="insp-fadein"  type="range" min="0" max="2" step="0.01" value="0" title="fade in">
+          <input id="insp-fadeout" type="range" min="0" max="2" step="0.01" value="0" title="fade out">
+        </div>
+        <span id="insp-fades-v" class="val">0.00 / 0.00</span>
+      </div>
+
+      <div id="insp-wave" class="insp-wave" hidden>
+        <div class="insp-grid">
+          <label title="set-wave-clip-pitch → the Signalsmith STFT path: duration PRESERVED, pitch ×2^(st/12). STRETCH selection happens at GRAPH BUILD — stopped-only.">pitch st
+            <span class="stop-flag">stopped</span></label>
+          <input id="insp-pitch" type="range" min="-12" max="12" step="1" value="0">
+          <span id="insp-pitch-v" class="val">0</span>
+
+          <label title="set-wave-clip-speed → TRUE VARISPEED: content = sourceLen/r, pitch = f0·r. For r&lt;1 the page applies the window fix (set-clip-length = sourceLen/r) — the edit length is a pure CachedValue.">speed ×
+            <span class="stop-flag">stopped</span></label>
+          <input id="insp-speed" type="range" min="0.5" max="2" step="0.05" value="1">
+          <span id="insp-speed-v" class="val">1.00</span>
+        </div>
+        <div class="insp-btns">
+          <button id="insp-split" class="tb" data-stop-only
+            title="Split the clip at the playhead (split-clip, timeline seconds). Stopped-only.">✂ split at playhead</button>
+          <button id="insp-delete" class="tb tb-danger" data-stop-only
+            title="delete-clip (undoable). Stopped-only.">🗑 delete clip</button>
+        </div>
+      </div>
+
+      <div id="insp-midi" class="insp-midi" hidden></div>
+    </div>
+
+    <!-- the Keys EQ-gain automation mini-editor (always present — one curve) -->
+    <div class="au-box">
+      <div class="au-head">
+        <span>KEYS · 4bandEq · <code>Low-pass gain</code> automation</span>
+        <label class="au-bypass" title="automation-set-bypass — LIVE. With the curve BYPASSED the param holds its manual value.">
+          <input type="checkbox" id="au-bypass"> curve bypassed
+        </label>
+      </div>
+      <canvas id="au-canvas" width="720" height="150"></canvas>
+      <div class="au-note"><b>Honest divergence:</b> the browser's <i>live</i> curve delivery is a
+        recorded divergence — in a steady window, curve-active ≈ curve-bypassed (§6j.6/§6i.2).
+        The <b>bounce composes the curve</b> (clock-independent render loop) — hear it via the
+        Analysis tab's <i>curve ON vs OFF</i> A/B. Drag points: vertical = value
+        (<code>automation-set-point-value {v}</code>), horizontal = time
+        (<code>automation-add-point {t,v,c}</code>).</div>
+    </div>
+  </div>
+
+  <!-- ── Mixer ─────────────────────────────────────────────────────── -->
+  <div class="panel" id="tab-mixer">
+    <div id="mixer"><!-- strips injected by JS --></div>
+    <div class="mixer-note">Faders/pan/M/S/send-gain are LIVE mid-play. Folder fader −6 dB (the E2e submix).
+      Meters: the engine's own read-and-clear track levels, polled at ~12 Hz while playing; after any polling gap one read is discarded (the accumulation window — §6f.6). −1000 = no meter · −100 = metered silence.</div>
+  </div>
+
+  <!-- ── Analysis ──────────────────────────────────────────────────── -->
+  <div class="panel" id="tab-analysis">
+    <div class="an-row">
+      <button id="an-bounce" class="tb tb-accent" data-stop-only>⬤ BOUNCE 0 → 19.2 s (master chain)</button>
+      <button id="an-analyse" class="tb" disabled>⌾ ANALYSE (E4d)</button>
+      <button id="an-download" class="tb" disabled>⬇ download WAV</button>
+      <button id="an-ab" class="tb" data-stop-only>∠ curve ON vs OFF (A/B bounces)</button>
+      <span id="an-busy" class="busy"></span>
+    </div>
+    <div id="an-stats" class="an-stats"></div>
+    <div class="an-cols">
+      <div class="an-col">
+        <div class="an-sub">engine analysis (analyse-audio-file → JSON, null-checked fields)</div>
+        <div id="an-json" class="an-json">— no analysis yet —</div>
+      </div>
+      <div class="an-col">
+        <div class="an-sub">third-octave spectrum (bandDb)</div>
+        <canvas id="an-bands" width="520" height="180"></canvas>
+        <div class="an-sub">live spectrum (while playing)</div>
+        <canvas id="an-spectrum" width="520" height="90"></canvas>
+      </div>
+    </div>
+    <div id="an-ab-out" class="an-ab"></div>
+  </div>
+
+  <!-- ── Verify ────────────────────────────────────────────────────── -->
+  <div class="panel" id="tab-verify">
+    <div class="vf-head">
+      <button id="vf-run-all" class="tb tb-accent">▶ run all (V1 → V14)</button>
+      <span class="vf-note">Every audible test parks the transport first: stop → 300 ms → seek → 200 ms → play → 600 ms settle (spec §6.13).
+        Band energies are Goertzel taps on the AnalyserNode with non-harmonic neighbours (≥25 % separation). Mutating tests restore + re-verify.</span>
+    </div>
+    <table id="vf-table">
+      <thead><tr><th>#</th><th>test</th><th>method</th><th>measured</th><th>result</th><th></th></tr></thead>
+      <tbody id="vf-body"></tbody>
+    </table>
+  </div>
+
+  <!-- ── About ─────────────────────────────────────────────────────── -->
+  <div class="panel" id="tab-about">
+    <div class="about-cols">
+      <div>
+        <h3>What this is</h3>
+        <p>One page that boots the real Tracktion engine (wasm, <code>c39d5e32</code> —
+          sha256 <code>c39d5e32c8d9e380740cf1834657fa5921bb563827566b7bbc698ae4e1eed621</code>),
+          builds a musical 8-bar arrangement live (100 BPM, E&nbsp;minor), and lets you
+          play it, tweak every surface, and run a measured verification suite — every
+          control maps 1:1 to a real engine export.</p>
+        <h3>The E1–E4 capability map</h3>
+        <table class="about-map">
+          <tr><td>E1</td><td>sfizz SFZ sampler</td><td>EP (10 samples) + Bass (4 samples) instruments, per-track registries, <code>amp_veltrack</code> velocity response</td></tr>
+          <tr><td>E2a</td><td>plugin surface</td><td>4bandEq (Keys + master), impulseResponse (bus) — the e2a-FILTERED plugin space</td></tr>
+          <tr><td>E2b</td><td>mixer topology</td><td>Keys → aux send → Reverb bus (bus 0), master chain, live meters</td></tr>
+          <tr><td>E2c</td><td>audio in the timeline</td><td>4 synthesized stereo drum wave clips (registry + insert + gain/pan/fades/mute)</td></tr>
+          <tr><td>E2d</td><td>undo + clip editing</td><td>move / set-length / split / delete by itemId, undo transactions</td></tr>
+          <tr><td>E2e</td><td>automation + folders</td><td>SYNTHS folder (−6 dB submix), Keys EQ-gain curve, live-input target</td></tr>
+          <tr><td>E3</td><td>bounce / export</td><td>offline render → engine stats → bytes out (transferred) → download</td></tr>
+          <tr><td>E4</td><td>DSP completion</td><td>IR convolution (browser leg: <code>ir-load-data</code>), clip PITCH (STFT) + SPEED (varispeed + window fix), offline analysis (true peak, LUFS, third-octave)</td></tr>
+        </table>
+        <h3>Honest divergences (recorded, not hidden)</h3>
+        <ul>
+          <li><b>Live automation curve delivery:</b> in a steady browser window, curve-active ≈ bypassed (§6j.6/§6i.2). The <b>bounce composes the curve</b> — the Analysis A/B is the audible leg.</li>
+          <li><b>Clip-gain sawtooth:</b> a live clip-gain write class shows a restart sawtooth (§6g.4) — the gain slider is stopped-only.</li>
+          <li><b>Field names:</b> the automation payload rides <code>t / v / c</code> (the worklet's reads) — the phase-exit demo's <code>tSec/value/curve</code> was a transcribed bug (R1-P0-4) and is NOT copied here.</li>
+          <li><b>Realtime safety:</b> the browser's own output path can hide small glitches the engine's drop counters still see (and vice-versa for output-device dropouts) — V14 prints the caveat.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>The arrangement</h3>
+        <p>100 BPM · 8 bars · 19.2 s · E minor: Drums (4 wave-clip sections, last one carries a fill) ·
+          SYNTHS folder ⊃ Keys (sfizz EP, Em–C–G–D whole-bar pads + sparse top melody, 4bandEq with the
+          −12 dB → 0 dB low-shelf curve, send → Reverb) + Bass (sfizz, roots + fifths) ·
+          Reverb bus (impulseResponse, synthesized 2.2 s IR) · Master (4bandEq mid-cut toggle).</p>
+        <h3>Phase demos (this repo)</h3>
+        <ul class="about-links">
+          <li><a href="/phase-e1-demo.html" target="_blank">E1 — sfizz</a></li>
+          <li><a href="/phase-e2a-demo.html" target="_blank">E2a — plugins</a></li>
+          <li><a href="/phase-e2b-demo.html" target="_blank">E2b — mixer</a></li>
+          <li><a href="/phase-e2c-demo.html" target="_blank">E2c — wave clips</a></li>
+          <li><a href="/phase-e2d-demo.html" target="_blank">E2d — undo/clip edit</a></li>
+          <li><a href="/phase-e2e-demo.html" target="_blank">E2e — automation/folders</a></li>
+          <li><a href="/phase-exit-demo.html" target="_blank">E2 EXIT — composed arrangement</a></li>
+          <li><a href="/phase-e3-demo.html" target="_blank">E3 — bounce/export</a></li>
+          <li><a href="/phase9-demo.html" target="_blank">Phase 9 — multi-track + live keys</a></li>
+        </ul>
+        <h3>Test hooks</h3>
+        <p><code>window.__demo</code>: <code>boot()</code> · <code>buildArrangement()</code> ·
+          <code>state</code> · <code>post(msg)</code> · <code>waitFor(type, ms, match)</code> ·
+          <code>runVerify(id|'all')</code> · <code>verifyResults</code> · <code>analyser</code> ·
+          <code>lastAnalysis</code> · <code>selectClip(trackId, clipIdx)</code> ·
+          <code>pianoNoteOn/Off(note, vel)</code> (spec §9).</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════ STATUS STRIP (§7.5) ════════════════════ -->
+<footer id="warnbar">
+  <button id="warn-toggle" class="warn-toggle">▸ <span id="warn-count">0</span> warnings</button>
+  <span id="warn-tail" class="warn-tail"></span>
+  <div id="warn-list" class="warn-list" hidden></div>
+</footer>
+
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="/v2-demo.js"></script>
+</body>
+</html>

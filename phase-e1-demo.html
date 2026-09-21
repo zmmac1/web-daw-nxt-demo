@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase E1 — sfizz SFZ Sampler</title>
+<style>
+  body { font-family: ui-monospace, monospace; background: #111; color: #ddd;
+         margin: 0; padding: 18px; max-width: 780px; }
+  h1 { font-size: 15px; color: #8fd; margin: 0 0 6px; }
+  p.sub { font-size: 11px; color: #999; margin: 0 0 14px; }
+  button { margin: 4px 4px 4px 0; padding: 6px 12px; font-size: 12px;
+           background: #222; color: #dfd; border: 1px solid #456; cursor: pointer; }
+  #log { font-size: 11px; white-space: pre-wrap; background: #000;
+         color: #9c9; border: 1px solid #333; padding: 8px; height: 200px;
+         overflow-y: scroll; }
+  #status { font-size: 12px; color: #fd8; margin: 10px 0; }
+  #meter { width: 100%; height: 10px; background: #222; margin-top: 8px; }
+  #meterfill { height: 10px; width: 0%; background: #4c6; }
+</style>
+</head>
+<body>
+<h1>Phase E1 — sfizz (the real SFZ sampler) in the browser engine</h1>
+<p class="sub">Track 1 carries an SfizzPlugin fed a 440 Hz sample + a one-region
+SFZ; the note is sequencer-scheduled at beat 2. Requires the E1 wasm build
+(sfizz linked in). Measurement taps: RMS + dominant frequency (AnalyserNode,
+smoothing 0 — the §6b discipline).</p>
+<button id="start">start audio + engine</button>
+<button id="load">register sample + load SFZ</button>
+<button id="arm">schedule note (clip @ beat 2)</button>
+<button id="play">play</button>
+<button id="stop">stop</button>
+<div id="status">idle</div>
+<div id="meter"><div id="meterfill"></div></div>
+<div id="log"></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000, BLOCK = 128, BPM = 120, BEAT_SEC = 0.5;
+const E1 = { freq: 440.0, root: 60, onsetBeat: 2.0, track: 1 };
+
+let audioCtx = null, workletNode = null, analyser = null;
+let engineReady = false, audioRunning = false;
+let numTracks = 1, instrumentLoaded = false, noteScheduled = false;
+const replies = [];
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(s) { logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+function setStatus(s) { statusEl.textContent = s; }
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+function waitFor(type, ms = 6000) {
+  const t0 = performance.now();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const hit = replies.find((r) => r.type === type);
+      if (hit) { clearInterval(iv); resolve(hit); }
+      else if (performance.now() - t0 > ms) { clearInterval(iv); resolve(null); }
+    }, 30);
+  });
+}
+
+function workletOnMessage(d) {
+  if (d && d.type === 'warn') log('WARN: ' + d.message);
+  if (d && d.type === 'ready') replies.push(d);
+  if (d && (d.type === 'sfizz-added' || d.type === 'sfizz-loaded' ||
+            d.type === 'sfizz-sample-registered' || d.type === 'sfizz-status' ||
+            d.type === 'sfizz-region-count' || d.type === 'track-added' ||
+            d.type === 'clip-note')) replies.push(d);
+}
+
+// ---- the gate asset, in-page (the §5 recipe: 16-bit-quantized sine,
+// 5 ms fades — the SAME generator as the native suite) ----
+function sfzSine440() {
+  const n = Math.floor(0.5 * SAMPLE_RATE);
+  const fade = Math.floor(0.005 * SAMPLE_RATE);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const edge = Math.min(i, n - 1 - i);
+    const g = edge >= fade ? 1 : edge / fade;
+    const v = 0.5 * g * Math.sin(2 * Math.PI * 440.0 * i / SAMPLE_RATE);
+    out[i] = Math.round(v * 32767) / 32767;
+  }
+  return out;
+}
+
+// ============================================================================
+// Audio startup (the phase10 pattern: analyser tap, smoothing 0)
+// ============================================================================
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => workletOnMessage(e.data);
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`wasm fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    post({ type: 'init-wasm', wasmBinary, instrument: 'sampler', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = ready && ready.engineCreated === true;
+    log('engine ready: ' + engineReady);
+    audioRunning = true;
+    // the page-driven pump (§6a.5)
+    setInterval(() => { if (workletNode) post({ type: 'pump' }); }, 100);
+    // a second track for the sfizz instrument (insert-only pre-play)
+    post({ type: 'add-track', name: 'sfizz' });
+    const t = await waitFor('track-added');
+    numTracks = t ? t.numTracks : 1;
+    log('tracks: ' + numTracks);
+    post({ type: 'add-sfizz', trackId: E1.track });
+    const added = await waitFor('sfizz-added');
+    if (!added) { setStatus('add-sfizz FAILED — stale wasm? (E1 build required)'); return; }
+    log('sfizz added (rc=' + added.rc + ')');
+    setStatus(engineReady ? 'engine ready' : 'engine FAILED');
+  } catch (e) {
+    setStatus('ERROR: ' + String(e)); log('startAudio threw: ' + String(e));
+  }
+};
+
+// ============================================================================
+// The instrument load: register sample → load SFZ (the ordering contract)
+// ============================================================================
+window.loadInstrument = async function () {
+  if (!engineReady) return false;
+  const data = sfzSine440();
+  post({ type: 'sfizz-register-sample', trackId: E1.track, name: 'sine440.wav',
+         data, numFrames: data.length, numChannels: 1, sampleRate: SAMPLE_RATE });
+  const reg = await waitFor('sfizz-sample-registered');
+  if (!reg || reg.rc !== 0) { setStatus('register FAILED'); return false; }
+  log('sample registered');
+  post({ type: 'sfizz-load-string', trackId: E1.track,
+         text: '<region> sample=sine440.wav key=' + E1.root + '\n', wait: 1 });
+  const loaded = await waitFor('sfizz-loaded');
+  if (!loaded || loaded.rc !== 0) { setStatus('sfizz-load FAILED'); return false; }
+  log('SFZ loaded (regions=' + loaded.numRegions + ')');
+  instrumentLoaded = loaded.numRegions === 1;
+  return instrumentLoaded;
+};
+
+// ============================================================================
+// The arrangement: a clip at beat 2 carrying the note
+// ============================================================================
+window.scheduleNote = async function () {
+  if (!instrumentLoaded) return false;
+  post({ type: 'add-midi-clip', trackId: E1.track,
+         startBeat: E1.onsetBeat, lengthBeats: 4.0 });
+  // add-midi-clip/add-midi-note have no reply — poll the region-free state
+  // via a clip-note readback after posting (the phase-11 pattern would
+  // over-build here; the test drives readback via its own evaluate).
+  post({ type: 'add-midi-note', trackId: E1.track, pitch: E1.root,
+         velocity: 127, startBeat: 0.0, lengthBeats: 2.0 });
+  noteScheduled = true;
+  log('note scheduled (clip @ beat ' + E1.onsetBeat + ')');
+  return true;
+};
+
+window.play = async function () { post({ type: 'transport-play' }); };
+window.stop = async function () { post({ type: 'transport-stop' }); };
+window.seek = async function (sec) { post({ type: 'seek', seconds: sec }); };
+
+// ============================================================================
+// Measurement taps (the phase10 pattern — the analyser is the waveform check)
+// ============================================================================
+window.tapRms = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(d);
+  let s = 0;
+  for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+  return Math.sqrt(s / d.length);
+};
+window.tapSpectrum = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(d);
+  let best = -Infinity, bi = -1;
+  for (let i = 1; i < d.length; i++) if (d[i] > best) { best = d[i]; bi = i; }
+  return { binHz: (bi * analyser.context.sampleRate) / analyser.fftSize, dB: best };
+};
+
+// ============================================================================
+// The test surface (window.__phaseE1 — the harness entry points)
+// ============================================================================
+window.__phaseE1 = {
+  state: () => ({ engineReady, audioRunning, numTracks, instrumentLoaded,
+                  noteScheduled, analyser: !!analyser }),
+  startAudio: () => window.startAudio(),
+  loadInstrument: () => window.loadInstrument(),
+  scheduleNote: () => window.scheduleNote(),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (s) => window.seek(s),
+  tapRms: () => window.tapRms(),
+  tapSpectrum: () => window.tapSpectrum(),
+  position: async () => { /* the worklet position readback via dump-status is
+                             page-model dependent; the taps carry the truth */ return null; },
+};
+
+document.getElementById('start').onclick = () => window.startAudio();
+document.getElementById('load').onclick = () => window.loadInstrument();
+document.getElementById('arm').onclick = () => window.scheduleNote();
+document.getElementById('play').onclick = () => window.play();
+document.getElementById('stop').onclick = () => window.stop();
+</script>
+</body>
+</html>

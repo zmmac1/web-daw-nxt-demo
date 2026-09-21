@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase E2d — Undo + clip editing + tempo</title>
+<style>
+  body { font-family: ui-monospace, monospace; background: #111; color: #ddd;
+         margin: 0; padding: 18px; max-width: 780px; }
+  h1 { font-size: 15px; color: #8fd; margin: 0 0 6px; }
+  p.sub { font-size: 11px; color: #999; margin: 0 0 14px; }
+  button { margin: 4px 4px 4px 0; padding: 6px 12px; font-size: 12px;
+           background: #222; color: #dfd; border: 1px solid #456; cursor: pointer; }
+  #log { font-size: 11px; white-space: pre-wrap; background: #000;
+         color: #9c9; border: 1px solid #333; padding: 8px; height: 220px;
+         overflow-y: scroll; }
+  #status { font-size: 12px; color: #fd8; margin: 10px 0; }
+</style>
+</head>
+<body>
+<h1>Phase E2d — undo + clip editing + tempo (the itemId-addressed surface)</h1>
+<p class="sub">The E2c clip scaffolding + the E2d editing panel: the undo/redo
+bar (the history readback rendered from the name getter), the clip
+move/split/delete/region ops (itemId-addressed, pre-play), the tempo panel
+(insert/remove/readback), and the divergence instrument (the transport-events
+counter + the pump-interval selector). Requires the E2d wasm build.</p>
+<button id="start">start audio + engine + register + insert</button>
+<button id="play">play</button>
+<button id="stop">stop</button>
+<button id="undo">undo</button>
+<button id="redo">redo</button>
+<button id="move">move clip → 1.0s</button>
+<button id="split">split @ 1.25s</button>
+<button id="delete">delete clip</button>
+<div id="status">idle</div>
+<div id="log"></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000;
+const E2D = {
+  freq: 440.0, amp: 0.5,
+  frames: 96000,             // 2.0 s
+  start: 0.25, len: 2.0,     // the clip window
+  name: 'e2c', track: 1,
+  moveTo: 1.0, splitAt: 1.25,
+};
+
+let audioCtx = null, workletNode = null, analyser = null;
+let engineReady = false, audioRunning = false;
+let numTracks = 1, clipInserted = false, registered = false;
+let clipIdx = -1, itemId = 0;
+const replies = [];
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(s) { logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+function setStatus(s) { statusEl.textContent = s; }
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+function waitFor(type, ms = 6000, match = null) {
+  // CONSUME-ONCE (the §6e.3 discipline): the matched reply is REMOVED —
+  // a stale same-shape reply can never shadow a fresh query's answer.
+  const pred = typeof type === 'function' ? type
+    : (r) => r.type === type && (!match || match(r));
+  const t0 = performance.now();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const idx = replies.findIndex(pred);
+      if (idx >= 0) { clearInterval(iv); resolve(replies.splice(idx, 1)[0]); }
+      else if (performance.now() - t0 > ms) { clearInterval(iv); resolve(null); }
+    }, 30);
+  });
+}
+
+function workletOnMessage(d) {
+  if (d && d.type === 'warn') log('WARN: ' + d.message);
+  if (d && (d.type === 'ready' || d.type === 'track-added' ||
+            // the E2c reply family (the collector completeness lesson —
+            // a reply type MISSING here is silently DROPPED, §6e.3)
+            d.type === 'audio-buffer-registered' ||
+            d.type === 'audio-buffer-unregistered' ||
+            d.type === 'wave-clip-inserted' ||
+            d.type === 'num-wave-clips' ||
+            d.type === 'wave-clip-info' ||
+            d.type === 'clip-gain-set' || d.type === 'clip-pan-set' ||
+            d.type === 'clip-mute-set' || d.type === 'clip-fades-set' ||
+            d.type === 'edit-xml' ||
+            // the E2d reply family (the same completeness rule)
+            d.type === 'undo-begun' || d.type === 'undo-done' ||
+            d.type === 'redo-done' || d.type === 'can-undo' ||
+            d.type === 'can-redo' || d.type === 'num-undo' ||
+            d.type === 'undo-name' || d.type === 'num-redo' ||
+            d.type === 'redo-name' || d.type === 'clip-moved' ||
+            d.type === 'clip-length-set' || d.type === 'clip-split' ||
+            d.type === 'clip-deleted' || d.type === 'clip-region-deleted' ||
+            d.type === 'tempo-change-inserted' || d.type === 'tempo-removed' ||
+            d.type === 'num-tempos' || d.type === 'tempo-info' ||
+            d.type === 'transport-events' ||
+            // the E2b family (the composition surface)
+            d.type === 'aux-bus-added' || d.type === 'aux-send-added' ||
+            d.type === 'aux-send-count' || d.type === 'aux-send-gain-set' ||
+            d.type === 'track-level' || d.type === 'master-level'))
+    replies.push(d);
+}
+
+// ---- the gate asset, in-page: pure-float PLANAR stereo (no quantization) ----
+function e2dSinePcm(freq, frames, chans, amp) {
+  const out = new Float32Array(frames * chans);
+  for (let i = 0; i < frames; i++) {
+    const v = amp * Math.sin((2 * Math.PI * freq * i) / SAMPLE_RATE);
+    out[i] = v;
+    if (chans === 2) out[frames + i] = v;
+  }
+  return out;
+}
+
+// ============================================================================
+// Audio startup (the e2a/e2b/e2c pattern: analyser tap, smoothing 0) + the
+// PUMP INTERVAL hook (the G-E divergence twin's control surface — v2 P2-7)
+// ============================================================================
+let pumpTimer = null;
+let pumpIntervalMs = 100;
+function startPump() {
+  if (pumpTimer) clearInterval(pumpTimer);
+  pumpTimer = setInterval(() => { if (workletNode) post({ type: 'pump' }); }, pumpIntervalMs);
+}
+window.setPumpInterval = function (ms) {
+  pumpIntervalMs = Math.max(5, Number(ms) || 100);
+  startPump();
+  log('pump interval: ' + pumpIntervalMs + ' ms');
+};
+
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => workletOnMessage(e.data);
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`wasm fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    post({ type: 'init-wasm', wasmBinary, instrument: 'none', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = ready && ready.engineCreated === true;
+    log('engine ready: ' + engineReady);
+    audioRunning = true;
+    // the page-driven pump (§6a.5) — the twin sweeps it via setPumpInterval
+    startPump();
+    // the audio-clip track (insert-only pre-play)
+    post({ type: 'add-track', name: 'e2d-main' });
+    const t = await waitFor('track-added');
+    numTracks = t ? t.numTracks : 1;
+    log('tracks: ' + numTracks);
+    // register the PCM (planar stereo; the wrapper interleaves)
+    const pcm = e2dSinePcm(E2D.freq, E2D.frames, 2, E2D.amp);
+    post({ type: 'register-audio-buffer', name: E2D.name, pcm,
+           numFrames: E2D.frames, numChannels: 2, sampleRate: SAMPLE_RATE });
+    const reg = await waitFor('audio-buffer-registered');
+    if (!reg || reg.rc !== 0) { setStatus('register FAILED rc=' + (reg && reg.rc)); return; }
+    registered = true;
+    log('buffer registered: ' + E2D.name);
+    // insert the clip (FRAMED — the e2d-frame name lands in the history)
+    post({ type: 'undo-begin', name: 'e2d-frame-insert' });
+    await waitFor('undo-begun');
+    post({ type: 'insert-wave-clip', trackId: E2D.track, name: E2D.name,
+           startSec: E2D.start, lengthSec: E2D.len });
+    const ins = await waitFor('wave-clip-inserted');
+    if (!ins || ins.rc < 0) { setStatus('insert FAILED rc=' + (ins && ins.rc)); return; }
+    clipIdx = ins.clipIdx;
+    clipInserted = true;
+    // capture the itemId (the E2d handle)
+    const info0 = await window.getClipInfo(E2D.track, clipIdx);
+    itemId = info0 ? Number(info0.itemId) : 0;
+    log('clip inserted: idx ' + clipIdx + ', itemId ' + itemId);
+    setStatus(engineReady ? 'engine + clip ready (itemId ' + itemId + ')' : 'engine FAILED');
+  } catch (e) {
+    setStatus('ERROR: ' + String(e)); log('startAudio threw: ' + String(e));
+  }
+};
+
+// ============================================================================
+// The E2d surface entry points (the flow under test)
+// ============================================================================
+window.undoBegin = async function (name) {
+  post({ type: 'undo-begin', name: String(name || '') });
+  return await waitFor((r) => r.type === 'undo-begun');
+};
+window.undo = async function () {
+  post({ type: 'undo' });
+  return await waitFor('undo-done');
+};
+window.redo = async function () {
+  post({ type: 'redo' });
+  return await waitFor('redo-done');
+};
+window.canUndo = async function () {
+  post({ type: 'can-undo' });
+  const r = await waitFor('can-undo');
+  return r ? r.value : null;
+};
+window.canRedo = async function () {
+  post({ type: 'can-redo' });
+  const r = await waitFor('can-redo');
+  return r ? r.value : null;
+};
+window.numUndo = async function () {
+  post({ type: 'get-num-undo' });
+  const r = await waitFor('num-undo');
+  return r ? r.num : null;
+};
+window.numRedo = async function () {
+  post({ type: 'get-num-redo' });
+  const r = await waitFor('num-redo');
+  return r ? r.num : null;
+};
+window.getUndoName = async function (index) {
+  post({ type: 'get-undo-name', index: index | 0 });
+  const r = await waitFor((r) => r.type === 'undo-name' && r.index === (index | 0));
+  return r ? r.name : null;
+};
+window.moveClip = async function (id, newStart) {
+  post({ type: 'move-clip', itemId: Number(id) | 0, newStartSec: Number(newStart) });
+  return await waitFor((r) => r.type === 'clip-moved' && r.itemId === (Number(id) | 0));
+};
+window.setClipLength = async function (id, newLen) {
+  post({ type: 'set-clip-length', itemId: Number(id) | 0, newLengthSec: Number(newLen) });
+  return await waitFor((r) => r.type === 'clip-length-set' && r.itemId === (Number(id) | 0));
+};
+window.splitClip = async function (id, splitSec) {
+  post({ type: 'split-clip', itemId: Number(id) | 0, splitSec: Number(splitSec) });
+  return await waitFor((r) => r.type === 'clip-split' && r.itemId === (Number(id) | 0));
+};
+window.deleteClip = async function (id) {
+  post({ type: 'delete-clip', itemId: Number(id) | 0 });
+  return await waitFor((r) => r.type === 'clip-deleted' && r.itemId === (Number(id) | 0));
+};
+window.deleteClipRegion = async function (id, start, end) {
+  post({ type: 'delete-clip-region', itemId: Number(id) | 0,
+         startSec: Number(start), endSec: Number(end) });
+  return await waitFor((r) => r.type === 'clip-region-deleted' && r.itemId === (Number(id) | 0));
+};
+window.insertTempoChange = async function (atSec, bpm) {
+  post({ type: 'insert-tempo-change', atSec: Number(atSec), bpm: Number(bpm) });
+  return await waitFor('tempo-change-inserted');
+};
+window.removeTempo = async function (index) {
+  post({ type: 'remove-tempo', index: index | 0 });
+  return await waitFor((r) => r.type === 'tempo-removed' && r.index === (index | 0));
+};
+window.numTempos = async function () {
+  post({ type: 'get-num-tempos' });
+  const r = await waitFor('num-tempos');
+  return r ? r.num : null;
+};
+window.getTempoInfo = async function (index) {
+  post({ type: 'get-tempo-info', index: index | 0 });
+  const r = await waitFor((r) => r.type === 'tempo-info' && r.index === (index | 0));
+  return r ? r.info : null;
+};
+window.getTransportEvents = async function () {
+  post({ type: 'get-transport-events' });
+  const r = await waitFor('transport-events');
+  return r ? r.count : null;
+};
+// the E2c surface (the shared scaffolding — the info getter + the XML)
+window.getClipInfo = async function (trackId, idx) {
+  post({ type: 'get-wave-clip-info', trackId: trackId | 0, clipIdx: idx | 0 });
+  const r = await waitFor((r) => r.type === 'wave-clip-info' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+  return r ? r.info : null;
+};
+window.numClips = async function (trackId) {
+  post({ type: 'num-wave-clips', trackId: trackId | 0 });
+  const r = await waitFor((r) => r.type === 'num-wave-clips' && r.trackId === (trackId | 0));
+  return r ? r.num : null;
+};
+window.getEditXml = async function () {
+  post({ type: 'get-edit-xml' });
+  const r = await waitFor('edit-xml');
+  return r ? r.xml : null;
+};
+// the E2c LIVE setters (the shared scaffolding — the divergence twin's
+// gain-write scenario rides them)
+window.setClipGain = async function (trackId, idx, gainDb) {
+  post({ type: 'set-clip-gain', trackId: trackId | 0, clipIdx: idx | 0,
+         gainDb: Number(gainDb) });
+  return await waitFor((r) => r.type === 'clip-gain-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+window.setClipMute = async function (trackId, idx, mute) {
+  post({ type: 'set-clip-mute', trackId: trackId | 0, clipIdx: idx | 0,
+         muted: !!mute });
+  return await waitFor((r) => r.type === 'clip-mute-set' &&
+                                r.trackId === (trackId | 0) && r.clipIdx === (idx | 0));
+};
+// the E2b meter (read-and-clear — the G-E instrument c: the track-vs-master
+// discrimination)
+window.getTrackLevel = async function (trackId) {
+  post({ type: 'get-track-level', trackId: trackId | 0 });
+  const r = await waitFor((r) => r.type === 'track-level' && r.trackId === (trackId | 0));
+  return r ? r.levelDb : null;   // the worklet's field is levelDb (read-and-clear)
+};
+
+window.play = async function () { post({ type: 'transport-play' }); };
+window.stop = async function () { post({ type: 'transport-stop' }); };
+window.seek = async function (sec) { post({ type: 'seek', seconds: sec }); };
+
+// ============================================================================
+// Measurement taps (the phase10 pattern — the analyser is the waveform check)
+// ============================================================================
+window.tapRms = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(d);
+  let s = 0;
+  for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+  return Math.sqrt(s / d.length);
+};
+window.tapSpectrum = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(d);
+  let best = -Infinity, bi = -1;
+  for (let i = 1; i < d.length; i++) if (d[i] > best) { best = d[i]; bi = i; }
+  return { binHz: (bi * analyser.context.sampleRate) / analyser.fftSize, dB: best };
+};
+
+// ============================================================================
+// The test surface (window.__phaseE2d — the harness entry points)
+// ============================================================================
+window.__phaseE2d = {
+  state: () => ({ engineReady, audioRunning, numTracks, registered,
+                 clipInserted, clipIdx, itemId, analyser: !!analyser,
+                 pumpIntervalMs }),
+  startAudio: () => window.startAudio(),
+  setPumpInterval: (ms) => window.setPumpInterval(ms),
+  undoBegin: (n) => window.undoBegin(n),
+  undo: () => window.undo(),
+  redo: () => window.redo(),
+  canUndo: () => window.canUndo(),
+  canRedo: () => window.canRedo(),
+  numUndo: () => window.numUndo(),
+  numRedo: () => window.numRedo(),
+  getUndoName: (i) => window.getUndoName(i),
+  moveClip: (id, s) => window.moveClip(id, s),
+  setClipLength: (id, l) => window.setClipLength(id, l),
+  splitClip: (id, s) => window.splitClip(id, s),
+  deleteClip: (id) => window.deleteClip(id),
+  deleteClipRegion: (id, s, e) => window.deleteClipRegion(id, s, e),
+  insertTempoChange: (s, b) => window.insertTempoChange(s, b),
+  removeTempo: (i) => window.removeTempo(i),
+  numTempos: () => window.numTempos(),
+  getTempoInfo: (i) => window.getTempoInfo(i),
+  getTransportEvents: () => window.getTransportEvents(),
+  getClipInfo: (t, i) => window.getClipInfo(t, i),
+  numClips: (t) => window.numClips(t),
+  getEditXml: () => window.getEditXml(),
+  setClipGain: (t, i, g) => window.setClipGain(t, i, g),
+  setClipMute: (t, i, m) => window.setClipMute(t, i, m),
+  getTrackLevel: (t) => window.getTrackLevel(t),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (s) => window.seek(s),
+  tapRms: () => window.tapRms(),
+  tapSpectrum: () => window.tapSpectrum(),
+};
+
+document.getElementById('start').onclick = () => window.startAudio();
+document.getElementById('play').onclick = () => window.play();
+document.getElementById('stop').onclick = () => window.stop();
+document.getElementById('undo').onclick = async () => {
+  const r = await window.undo(); log('undo: ' + JSON.stringify(r));
+};
+document.getElementById('redo').onclick = async () => {
+  const r = await window.redo(); log('redo: ' + JSON.stringify(r));
+};
+document.getElementById('move').onclick = async () => {
+  const r = await window.moveClip(itemId, E2D.moveTo);
+  log('move → 1.0s: ' + JSON.stringify(r));
+};
+document.getElementById('split').onclick = async () => {
+  const r = await window.splitClip(itemId, E2D.splitAt);
+  log('split @ 1.25: ' + JSON.stringify(r));
+  if (r && r.newItemId > 0) log('  the NEW itemId: ' + r.newItemId);
+};
+document.getElementById('delete').onclick = async () => {
+  const r = await window.deleteClip(itemId);
+  log('delete: ' + JSON.stringify(r));
+};
+</script>
+</body>
+</html>

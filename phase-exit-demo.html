@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase E2 EXIT — the composed arrangement (browser demo)</title>
+<style>
+  body { font-family: monospace; margin: 16px; max-width: 900px; }
+  button { margin: 4px 4px 4px 0; padding: 6px 12px; font-size: 12px;
+           font-family: inherit; }
+  .sub { color: #666; font-size: 12px; max-width: 800px; }
+  #status { font-weight: bold; margin: 8px 0; }
+  #log { white-space: pre-wrap; font-size: 11px; max-height: 300px;
+         overflow-y: auto; background: #f4f4f4; padding: 8px; }
+  h2 { font-size: 14px; margin: 18px 0 4px 0; border-bottom: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h1>Phase E2 EXIT — the V2-E2E master gate (the composed arrangement)</h1>
+<p class="sub">E1 sfizz + E2a EQ + E2b aux/bus/master + E2c wave clip + E2d
+undo + E2e folder/curve — ONE arrangement: 2 synth children in the folder
+submix + the top-level wave/send/bus + the master EQ + the automated curve.
+The browser gates pin the STRUCTURAL contracts + the curve-free band
+presence; the curve-driven render is a divergence record (the E2c G-D
+doctrine — the native/twin pin the audible semantics).</p>
+<button id="start">start audio + engine</button>
+<button id="build">build the arrangement</button>
+<button id="play">play</button>
+<button id="stop">stop</button>
+<button id="au-bypass">toggle curve bypass</button>
+<button id="f-mute">toggle folder mute</button>
+<button id="m-flat">toggle master EQ flat/cut</button>
+<button id="counters">read the counters</button>
+<div id="status">idle</div>
+<div id="log"></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000;
+const EXIT = {
+  f1: 440.0, f2: 587.3295, f3: 987.7666,
+  ampWave: 0.25, ampSfz: 0.5,
+};
+
+let audioCtx = null, workletNode = null, analyser = null;
+let engineReady = false, audioRunning = false;
+let built = false, folderId = 0, curveBypassed = false, folderMuted = false;
+let masterFlat = false;
+const replies = [];
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(s) { logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+function setStatus(s) { statusEl.textContent = s; }
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+function waitFor(type, ms = 8000, match = null) {
+  const pred = typeof type === 'function' ? type
+    : (r) => r.type === type && (!match || match(r));
+  const t0 = performance.now();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const idx = replies.findIndex(pred);
+      if (idx >= 0) { clearInterval(iv); resolve(replies.splice(idx, 1)[0]); }
+      else if (performance.now() - t0 > ms) { clearInterval(iv); resolve(null); }
+    }, 30);
+  });
+}
+
+// the reply collector (the completeness rule — a type missing here is
+// silently DROPPED, §6e.3)
+function workletOnMessage(d) {
+  if (d && d.type === 'warn') log('WARN: ' + d.message);
+  if (d && (d.type === 'ready' || d.type === 'track-count' ||
+            d.type === 'track-added' ||
+            d.type === 'audio-buffer-registered' ||
+            d.type === 'wave-clip-inserted' ||
+            d.type === 'num-wave-clips' || d.type === 'wave-clip-info' ||
+            d.type === 'plugin-added' || d.type === 'plugin-param-set' ||
+            d.type === 'plugin-param' || d.type === 'plugin-bypass-set' ||
+            d.type === 'sfizz-added' || d.type === 'sfizz-sample-registered' ||
+            d.type === 'sfizz-loaded' || d.type === 'sfizz-region-count' ||
+            d.type === 'sampler-sound-loaded' ||
+            d.type === 'wasm-sampler-added' ||
+            d.type === 'aux-send-added' || d.type === 'aux-send-mute-set' ||
+            d.type === 'aux-send-count' ||
+            d.type === 'aux-bus-added' ||
+            d.type === 'master-plugin-added' || d.type === 'master-param-set' ||
+            d.type === 'master-plugin-count' ||
+            d.type === 'automation-point-added' ||
+            d.type === 'automation-num-points' ||
+            d.type === 'automation-bypass-set' || d.type === 'automation-bypass' ||
+            d.type === 'folder-inserted' || d.type === 'track-added-in-folder' ||
+            d.type === 'folder-volume-set' || d.type === 'folder-mute-set' ||
+            d.type === 'track-parent-folder' ||
+            d.type === 'num-folder-tracks' || d.type === 'folder-track-id' ||
+            d.type === 'graph-rebuild-count' ||
+            d.type === 'rebuild-request-count' ||
+            d.type === 'rebuild-counters-reset' ||
+            d.type === 'track-level' || d.type === 'master-level' ||
+            d.type === 'transport-events'))
+    replies.push(d);
+}
+
+// the E1-verbatim asset (16-bit quantized, 5 ms fades), stereo-duplicated
+function sfzAsset(freq, seconds, amp) {
+  const n = Math.trunc(seconds * SAMPLE_RATE);
+  const fade = Math.max(1, Math.trunc(0.005 * SAMPLE_RATE));
+  const mono = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const edge = Math.min(i, n - 1 - i);
+    const g = edge >= fade ? 1 : edge / fade;
+    const v = amp * g * Math.sin((2 * Math.PI * freq * i) / SAMPLE_RATE);
+    mono[i] = Math.round(v * 32767) / 32767;
+  }
+  const both = new Float32Array(n * 2);
+  both.set(mono, 0); both.set(mono, n);
+  return both;
+}
+// synth_tone (decaying sine + 2nd harmonic), stereo-duplicated
+function tonePcm(freq, seconds, amp) {
+  const n = Math.trunc(seconds * SAMPLE_RATE);
+  const mono = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    mono[i] = amp * Math.exp((-2.2 * i) / SAMPLE_RATE)
+      * (Math.sin((2 * Math.PI * freq * i) / SAMPLE_RATE)
+         + 0.25 * Math.sin((4 * Math.PI * freq * i) / SAMPLE_RATE));
+  }
+  const both = new Float32Array(n * 2);
+  both.set(mono, 0); both.set(mono, n);
+  return both;
+}
+function wavePcm(freq, frames, amp) {
+  const out = new Float32Array(frames * 2);
+  for (let i = 0; i < frames; i++) {
+    const v = amp * Math.sin((2 * Math.PI * freq * i) / SAMPLE_RATE);
+    out[i] = v; out[frames + i] = v;
+  }
+  return out;
+}
+
+let pumpTimer = null, pumpIntervalMs = 100;
+function startPump() {
+  if (pumpTimer) clearInterval(pumpTimer);
+  pumpTimer = setInterval(() => { if (workletNode) post({ type: 'pump' }); }, pumpIntervalMs);
+}
+window.setPumpInterval = function (ms) {
+  pumpIntervalMs = Math.max(5, Number(ms) || 100);
+  startPump();
+};
+
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => workletOnMessage(e.data);
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`wasm fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    post({ type: 'init-wasm', wasmBinary, instrument: 'none', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = ready && ready.engineCreated === true;
+    audioRunning = true;
+    startPump();
+    setStatus(engineReady ? 'engine ready (track 0 pre-exists)' : 'engine FAILED');
+  } catch (e) {
+    setStatus('ERROR: ' + String(e)); log('startAudio threw: ' + String(e));
+  }
+};
+
+// ---- the composed arrangement builder (the native family's order) ----
+window.buildArrangement = async function () {
+  if (!engineReady) return { ok: false, why: 'engine not ready' };
+  const r = { ok: true };
+  // track 0: EQ + send + wave clip [0.25, 2.75]
+  post({ type: 'add-plugin', trackId: 0, pluginType: '4bandEq' });
+  r.eq0 = (await waitFor('plugin-added', 8000, (m) => m.trackId === 0)) || null;
+  post({ type: 'add-aux-send', trackId: 0, busNum: 0, gainDb: 0.0 });
+  r.send0 = (await waitFor('aux-send-added', 8000, (m) => m.trackId === 0)) || null;
+  const wp = wavePcm(EXIT.f3, 120000, EXIT.ampWave);
+  post({ type: 'register-audio-buffer', name: 'exit_wave', pcm: wp,
+         numFrames: 120000, numChannels: 2, sampleRate: SAMPLE_RATE });
+  r.regWave = (await waitFor('audio-buffer-registered', 12000,
+    (m) => m.name === 'exit_wave')) || null;
+  post({ type: 'insert-wave-clip', trackId: 0, name: 'exit_wave',
+         startSec: 0.25, lengthSec: 2.50 });
+  r.clip0 = (await waitFor('wave-clip-inserted', 8000, (m) => m.trackId === 0)) || null;
+  // the folder + the 2 synth children
+  post({ type: 'insert-folder', name: 'SYNTHS', parentFolderId: 0 });
+  const fi = await waitFor('folder-inserted');
+  folderId = fi ? Number(fi.folderId) : 0;
+  r.folderId = folderId;
+  post({ type: 'add-track-in-folder', folderId, name: 'SFIZZ' });
+  r.child1 = (await waitFor('track-added-in-folder', 8000,
+    (m) => m.name === 'SFIZZ')) || null;
+  post({ type: 'add-track-in-folder', folderId, name: 'SAMPLER' });
+  r.child2 = (await waitFor('track-added-in-folder', 8000,
+    (m) => m.name === 'SAMPLER')) || null;
+  // child 1: sfizz (E1-verbatim stereo asset) + EQ (the curve's target)
+  post({ type: 'add-sfizz', trackId: 1 });
+  r.sfizz = (await waitFor('sfizz-added', 8000, (m) => m.trackId === 1)) || null;
+  const sp = sfzAsset(EXIT.f1, 2.0, EXIT.ampSfz);
+  post({ type: 'sfizz-register-sample', trackId: 1, name: 'sine440.wav',
+         data: sp, numFrames: 96000, numChannels: 2, sampleRate: SAMPLE_RATE });
+  r.sfzReg = (await waitFor('sfizz-sample-registered', 12000,
+    (m) => m.trackId === 1)) || null;
+  post({ type: 'sfizz-load-string', trackId: 1,
+         text: '<region> sample=sine440.wav key=60\n', wait: 1 });
+  r.sfzLoad = (await waitFor('sfizz-loaded', 12000, (m) => m.trackId === 1)) || null;
+  post({ type: 'add-plugin', trackId: 1, pluginType: '4bandEq' });
+  r.eq1 = (await waitFor('plugin-added', 8000, (m) => m.trackId === 1)) || null;
+  post({ type: 'set-plugin-param', trackId: 1, pluginIdx: 0,
+         paramId: 'Low-pass freq', value: 8000.0 });
+  r.corner = (await waitFor('plugin-param-set', 8000,
+    (m) => m.trackId === 1 && m.paramId === 'Low-pass freq')) || null;
+  // child 2: the sampler (587.33) + EQ (+6 boost)
+  post({ type: 'add-wasm-sampler', trackId: 2 });
+  r.sampler = (await waitFor('wasm-sampler-added', 8000,
+    (m) => m.trackId === 2)) || null;
+  const tp = tonePcm(EXIT.f2, 2.0, 0.25);
+  post({ type: 'sampler-load-sound', trackId: 2, rootNote: 74, minNote: 74,
+         maxNote: 74, minVel: 1, maxVel: 127, data: tp,
+         numFrames: 96000, numChannels: 2, sampleRate: SAMPLE_RATE });
+  r.sound2 = (await waitFor('sampler-sound-loaded', 12000)) || null;
+  post({ type: 'add-plugin', trackId: 2, pluginType: '4bandEq' });
+  r.eq2 = (await waitFor('plugin-added', 8000, (m) => m.trackId === 2)) || null;
+  post({ type: 'set-plugin-param', trackId: 2, pluginIdx: 0,
+         paramId: 'Mid freq 1', value: EXIT.f2 });
+  await waitFor('plugin-param-set', 8000,
+    (m) => m.trackId === 2 && m.paramId === 'Mid freq 1');
+  post({ type: 'set-plugin-param', trackId: 2, pluginIdx: 0,
+         paramId: 'Mid gain 1', value: 6.0 });
+  await waitFor('plugin-param-set', 8000,
+    (m) => m.trackId === 2 && m.paramId === 'Mid gain 1');
+  post({ type: 'set-plugin-param', trackId: 2, pluginIdx: 0,
+         paramId: 'Mid Q 1', value: 1.0 });
+  await waitFor('plugin-param-set', 8000,
+    (m) => m.trackId === 2 && m.paramId === 'Mid Q 1');
+  // the MIDI (the add-midi cases warn-on-fail only — the structural
+  // readbacks + the audio gates are the proof)
+  post({ type: 'add-midi-clip', trackId: 1, startBeat: 0, lengthBeats: 8 });
+  await new Promise((res) => setTimeout(res, 150));
+  post({ type: 'add-midi-note', trackId: 1, pitch: 60, velocity: 127,
+         startBeat: 0, lengthBeats: 4 });
+  await new Promise((res) => setTimeout(res, 150));
+  post({ type: 'add-midi-clip', trackId: 2, startBeat: 0, lengthBeats: 8 });
+  await new Promise((res) => setTimeout(res, 150));
+  post({ type: 'add-midi-note', trackId: 2, pitch: 74, velocity: 100,
+         startBeat: 0, lengthBeats: 4 });
+  await new Promise((res) => setTimeout(res, 150));
+  // the bus: AuxReturn + reverb (wet 1.0, dry 0.0, room 0.8)
+  post({ type: 'add-aux-bus', name: 'REV', busNum: 0 });
+  r.bus = (await waitFor('aux-bus-added', 8000)) || null;
+  const busId = r.bus ? r.bus.trackId : 3;
+  post({ type: 'add-plugin', trackId: busId, pluginType: 'reverb' });
+  r.eq3 = (await waitFor('plugin-added', 8000, (m) => m.trackId === busId)) || null;
+  for (const [pid, v] of [['wet level', 1.0], ['dry level', 0.0], ['room size', 0.8]]) {
+    post({ type: 'set-plugin-param', trackId: busId, pluginIdx: 0,
+           paramId: pid, value: v });
+    await waitFor('plugin-param-set', 8000,
+      (m) => m.trackId === busId && m.paramId === pid);
+  }
+  // the master EQ (the mid cut -12 @ 587.33, Q 1)
+  post({ type: 'add-master-plugin', pluginType: '4bandEq' });
+  r.master = (await waitFor('master-plugin-added', 8000)) || null;
+  for (const [pid, v] of [['Mid freq 1', EXIT.f2], ['Mid gain 1', -12.0], ['Mid Q 1', 1.0]]) {
+    post({ type: 'set-master-param', pluginIdx: 0, paramId: pid, value: v });
+    await waitFor('master-param-set', 8000, (m) => m.paramId === pid);
+  }
+  // the curve (LIVE): (0.2, 0) -> (1.0, -20)
+  post({ type: 'automation-add-point', trackId: 1, pluginIdx: 0,
+         paramId: 'Low-pass gain', tSec: 0.2, value: 0.0, curve: 0.0 });
+  r.p0 = (await waitFor('automation-point-added', 8000)) || null;
+  post({ type: 'automation-add-point', trackId: 1, pluginIdx: 0,
+         paramId: 'Low-pass gain', tSec: 1.0, value: -20.0, curve: 0.0 });
+  r.p1 = (await waitFor('automation-point-added', 8000)) || null;
+  // NOTE: no standalone refresh case exists in the worklet — the FIRST
+  // play allocates the context and builds the FULL graph from the tree
+  // state (the no-context semantics: a pre-play refresh would only count
+  // a request anyway); the per-case auto-refreshes (insert-wave-clip,
+  // add-aux-bus, add-plugin) already covered the structural inserts.
+  await new Promise((res) => setTimeout(res, 300));
+  built = true;
+  r.ok = !!(r.eq0 && r.send0 && r.regWave && r.clip0 && r.folderId
+            && r.child1 && r.child2 && r.sfizz && r.sfzReg && r.sfzLoad
+            && r.eq1 && r.corner && r.sound2 && r.eq2 && r.bus && r.eq3
+            && r.master && r.p0 && r.p1);
+  log('arrangement built: ' + (r.ok ? 'OK' : 'INCOMPLETE') + JSON.stringify(r).slice(0, 400));
+  return r;
+};
+
+// ---- the test surface ----
+window.__phaseExit = {};
+window.__phaseExit.state = function () {
+  return { engineReady, audioRunning, built, folderId,
+           curveBypassed, folderMuted, masterFlat };
+};
+
+// the parked-seek pattern (SKILL §6i.3: stop → 0.3s → seek(X) → 0.2s → play
+// — the worklet re-asserts lastSeekSeconds; windows must satisfy
+// [park + settle + window] < the edit end)
+window.parkedPlay = async function (sec) {
+  post({ type: 'transport-stop' });
+  await new Promise((r) => setTimeout(r, 300));
+  post({ type: 'seek', seconds: Number(sec) });
+  await new Promise((r) => setTimeout(r, 200));
+  post({ type: 'transport-play' });
+  await new Promise((r) => setTimeout(r, 60));
+};
+window.stopPlayback = function () { post({ type: 'transport-stop' }); };
+window.seekTo = async function (sec) {
+  post({ type: 'seek', seconds: Number(sec) });
+  await new Promise((r) => setTimeout(r, 150));
+};
+
+// the analyser taps: the per-band dB (the bin nearest f) + the broadband RMS
+const fftBuf = new Float32Array(2048);
+const timeBuf = new Float32Array(2048);
+window.__phaseExit.tapBands = function () {
+  if (!analyser) return null;
+  analyser.getFloatFrequencyData(fftBuf);
+  const binOf = (f) => Math.round((f * 4096) / SAMPLE_RATE);
+  const at = (f) => (binOf(f) < fftBuf.length ? fftBuf[binOf(f)] : -200);
+  analyser.getFloatTimeDomainData(timeBuf);
+  let acc = 0;
+  for (let i = 0; i < timeBuf.length; i++) acc += timeBuf[i] * timeBuf[i];
+  return { b440: at(EXIT.f1), b587: at(EXIT.f2), b988: at(EXIT.f3),
+           b460: at(460.0), b634: at(634.0), b1037: at(1036.6),
+           rms: Math.sqrt(acc / timeBuf.length) };
+};
+window.__phaseExit.tapRms = window.__phaseExit.tapBands;
+
+// the toggles (LIVE writes; the parked re-play delivers them deterministically)
+window.__phaseExit.setCurveBypass = async function (b) {
+  post({ type: 'automation-set-bypass', trackId: 1, pluginIdx: 0,
+         paramId: 'Low-pass gain', bypass: b ? 1 : 0 });
+  const r = await waitFor('automation-bypass-set', 8000);
+  curveBypassed = !!b;
+  return r;
+};
+window.__phaseExit.setFolderMute = async function (m) {
+  post({ type: 'set-folder-mute', folderId, mute: m ? 1 : 0 });
+  const r = await waitFor('folder-mute-set', 8000);
+  folderMuted = !!m;
+  return r;
+};
+window.__phaseExit.setMasterFlat = async function (flat) {
+  post({ type: 'set-master-param', pluginIdx: 0, paramId: 'Mid gain 1',
+         value: flat ? 0.0 : -12.0 });
+  const r = await waitFor('master-param-set', 8000, (m) => m.paramId === 'Mid gain 1');
+  masterFlat = !!flat;
+  return r;
+};
+// the counter pair (the S-level instrument — browser-safe; the E2e
+// browser's play/stop-cycle form: a play allocates/rebuilds the context)
+window.__phaseExit.resetCounters = async function () {
+  post({ type: 'reset-rebuild-counters' });
+  await waitFor('rebuild-counters-reset', 6000);
+  post({ type: 'get-graph-rebuild-count' });
+  const rb = await waitFor('graph-rebuild-count', 6000);
+  post({ type: 'get-rebuild-request-count' });
+  const rq = await waitFor('rebuild-request-count', 6000);
+  return { rb: rb ? rb.count : -1, rq: rq ? rq.count : -1 };
+};
+window.__phaseExit.readCounters = async function () {
+  post({ type: 'get-graph-rebuild-count' });
+  const rb = await waitFor('graph-rebuild-count', 6000);
+  post({ type: 'get-rebuild-request-count' });
+  const rq = await waitFor('rebuild-request-count', 6000);
+  return { rb: rb ? rb.count : -1, rq: rq ? rq.count : -1 };
+};
+// the structural readback pack (the message types are the CASE names; the
+// reply field names per the worklet's actual shapes)
+window.__phaseExit.readback = async function () {
+  const out = {};
+  post({ type: 'num-tracks' });
+  out.numTracks = ((await waitFor('track-count', 6000)) || {}).numTracks;
+  post({ type: 'num-wave-clips', trackId: 0 });
+  out.waveClips = ((await waitFor('num-wave-clips', 6000,
+    (m) => m.trackId === 0)) || {}).num;
+  post({ type: 'automation-get-num-points', trackId: 1, pluginIdx: 0,
+         paramId: 'Low-pass gain' });
+  out.curvePoints = ((await waitFor('automation-num-points', 6000,
+    (m) => m.trackId === 1)) || {}).count;
+  post({ type: 'num-aux-sends', trackId: 0 });
+  out.sends = ((await waitFor('aux-send-count', 6000,
+    (m) => m.trackId === 0)) || {}).numSends;
+  post({ type: 'num-master-plugins' });
+  out.masterPlugins = ((await waitFor('master-plugin-count', 6000)) || {}).numPlugins;
+  post({ type: 'get-num-folder-tracks' });
+  out.folders = ((await waitFor('num-folder-tracks', 6000)) || {}).count;
+  post({ type: 'get-track-parent-folder', trackId: 1 });
+  out.parent1 = Number((((await waitFor('track-parent-folder', 6000,
+    (m) => m.trackId === 1)) || {}).folderId) || 0);
+  post({ type: 'get-track-parent-folder', trackId: 2 });
+  out.parent2 = Number((((await waitFor('track-parent-folder', 6000,
+    (m) => m.trackId === 2)) || {}).folderId) || 0);
+  return out;
+};
+
+// the buttons
+document.getElementById('start').onclick = () => window.startAudio();
+document.getElementById('build').onclick = () => window.buildArrangement();
+document.getElementById('play').onclick = () => post({ type: 'transport-play' });
+document.getElementById('stop').onclick = () => post({ type: 'transport-stop' });
+document.getElementById('au-bypass').onclick = () =>
+  window.__phaseExit.setCurveBypass(!curveBypassed);
+document.getElementById('f-mute').onclick = () =>
+  window.__phaseExit.setFolderMute(!folderMuted);
+document.getElementById('m-flat').onclick = () =>
+  window.__phaseExit.setMasterFlat(!masterFlat);
+document.getElementById('counters').onclick = () =>
+  window.__phaseExit.counters().then((c) => log('counters: ' + JSON.stringify(c)));
+</script>
+</body>
+</html>

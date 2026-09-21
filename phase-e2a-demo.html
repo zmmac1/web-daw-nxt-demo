@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase E2a — The generic plugin surface</title>
+<style>
+  body { font-family: ui-monospace, monospace; background: #111; color: #ddd;
+         margin: 0; padding: 18px; max-width: 780px; }
+  h1 { font-size: 15px; color: #8fd; margin: 0 0 6px; }
+  p.sub { font-size: 11px; color: #999; margin: 0 0 14px; }
+  button { margin: 4px 4px 4px 0; padding: 6px 12px; font-size: 12px;
+           background: #222; color: #dfd; border: 1px solid #456; cursor: pointer; }
+  #log { font-size: 11px; white-space: pre-wrap; background: #000;
+         color: #9c9; border: 1px solid #333; padding: 8px; height: 220px;
+         overflow-y: scroll; }
+  #status { font-size: 12px; color: #fd8; margin: 10px 0; }
+  #meter { width: 100%; height: 10px; background: #222; margin-top: 8px; }
+  #meterfill { height: 10px; width: 0%; background: #4c6; }
+</style>
+</head>
+<body>
+<h1>Phase E2a — the engine's own effects via ONE generic plugin surface</h1>
+<p class="sub">Track 1 = sfizz + a 440 Hz sine (1.5 s sustain — the LIVE
+param-write windows need the room), scheduled at beat 2. The generic surface
+add-plugin / params / set-param / bypass drives the ENGINE's 4bandEq
+(registered by PluginManager in every ctor — no wrapper plugin involved).
+Measurement taps: RMS + dominant frequency (AnalyserNode, smoothing 0 — the
+§6b discipline). Requires the E2a wasm build.</p>
+<button id="start">start audio + engine + instrument</button>
+<button id="addeq">add 4bandEq (generic)</button>
+<button id="play">play</button>
+<button id="cut">LIVE: cut mid band −20 dB @ 440</button>
+<button id="byp">bypass on</button>
+<button id="stop">stop</button>
+<div id="status">idle</div>
+<div id="meter"><div id="meterfill"></div></div>
+<div id="log"></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000, BPM = 120, BEAT_SEC = 0.5;
+const E2A = { freq: 440.0, root: 60, onsetBeat: 2.0, track: 1,
+              noteBeats: 4.0, assetSec: 2.0 };   // 2 s sustain: the LIVE
+        // write + bypass + UN-BYPASS tap windows all fit inside [1.0, 3.0] s
+
+let audioCtx = null, workletNode = null, analyser = null;
+let engineReady = false, audioRunning = false;
+let numTracks = 1, instrumentLoaded = false, noteScheduled = false;
+let eqAdded = false, numParams = -1, paramIds = null;
+const replies = [];
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(s) { logEl.textContent += s + '\n'; logEl.scrollTop = 1e9; }
+function setStatus(s) { statusEl.textContent = s; }
+function post(msg) { if (workletNode) workletNode.port.postMessage(msg); }
+
+function waitFor(type, ms = 6000, match = null) {
+  // CONSUME-ONCE: the matched reply is REMOVED from the array (the
+  // stale-match class — a second same-shape query returning the first
+  // reply's payload — dies here: each reply is consumed exactly once).
+  // match: an optional payload predicate; `type` may itself be a predicate.
+  const pred = typeof type === 'function' ? type
+    : (r) => r.type === type && (!match || match(r));
+  const t0 = performance.now();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const idx = replies.findIndex(pred);
+      if (idx >= 0) { clearInterval(iv); resolve(replies.splice(idx, 1)[0]); }
+      else if (performance.now() - t0 > ms) { clearInterval(iv); resolve(null); }
+    }, 30);
+  });
+}
+
+function workletOnMessage(d) {
+  if (d && d.type === 'warn') log('WARN: ' + d.message);
+  if (d && (d.type === 'ready' || d.type === 'track-added' ||
+            d.type === 'sfizz-added' || d.type === 'sfizz-loaded' ||
+            d.type === 'sfizz-sample-registered' ||
+            d.type === 'plugin-added' || d.type === 'plugin-count' ||
+            d.type === 'plugin-type' || d.type === 'plugin-params' ||
+            d.type === 'plugin-param' || d.type === 'plugin-param-set' ||
+            d.type === 'plugin-bypass-set' || d.type === 'plugin-removed' ||
+            d.type === 'plugin-moved' || d.type === 'plugin-property-set' ||
+            d.type === 'plugin-property')) replies.push(d);
+}
+
+// ---- the gate asset, in-page (§5 recipe; 1.5 s: the LIVE write windows) ----
+function sfzSine440(seconds) {
+  const n = Math.floor(seconds * SAMPLE_RATE);
+  const fade = Math.floor(0.005 * SAMPLE_RATE);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const edge = Math.min(i, n - 1 - i);
+    const g = edge >= fade ? 1 : edge / fade;
+    const v = 0.5 * g * Math.sin(2 * Math.PI * 440.0 * i / SAMPLE_RATE);
+    out[i] = Math.round(v * 32767) / 32767;
+  }
+  return out;
+}
+
+// ============================================================================
+// Audio startup (the phase10 pattern: analyser tap, smoothing 0)
+// ============================================================================
+window.startAudio = async function () {
+  if (audioRunning) return;
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(analyser = audioCtx.createAnalyser());
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0;
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => workletOnMessage(e.data);
+    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    log(`wasm fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    post({ type: 'init-wasm', wasmBinary, instrument: 'sampler', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = ready && ready.engineCreated === true;
+    log('engine ready: ' + engineReady);
+    audioRunning = true;
+    // the page-driven pump (§6a.5)
+    setInterval(() => { if (workletNode) post({ type: 'pump' }); }, 100);
+    // a second track for the sfizz instrument (insert-only pre-play)
+    post({ type: 'add-track', name: 'e2a' });
+    const t = await waitFor('track-added');
+    numTracks = t ? t.numTracks : 1;
+    log('tracks: ' + numTracks);
+    post({ type: 'add-sfizz', trackId: E2A.track });
+    const added = await waitFor('sfizz-added');
+    if (!added) { setStatus('add-sfizz FAILED — stale wasm? (E1 build required)'); return; }
+    // the instrument: register → load (the ordering contract)
+    const data = sfzSine440(E2A.assetSec);
+    post({ type: 'sfizz-register-sample', trackId: E2A.track, name: 'sine440.wav',
+           data, numFrames: data.length, numChannels: 1, sampleRate: SAMPLE_RATE });
+    const reg = await waitFor('sfizz-sample-registered');
+    if (!reg || reg.rc !== 0) { setStatus('register FAILED'); return; }
+    post({ type: 'sfizz-load-string', trackId: E2A.track,
+           text: '<region> sample=sine440.wav key=' + E2A.root + '\n', wait: 1 });
+    const loaded = await waitFor('sfizz-loaded');
+    if (!loaded || loaded.rc !== 0) { setStatus('sfizz-load FAILED'); return; }
+    instrumentLoaded = loaded.numRegions === 1;
+    log('instrument loaded (regions=' + loaded.numRegions + ')');
+    // the arrangement: clip @ beat 2, note spanning the 1.5 s sample
+    post({ type: 'add-midi-clip', trackId: E2A.track,
+           startBeat: E2A.onsetBeat, lengthBeats: 4.0 });
+    post({ type: 'add-midi-note', trackId: E2A.track, pitch: E2A.root,
+           velocity: 127, startBeat: 0.0, lengthBeats: E2A.noteBeats });
+    noteScheduled = true;
+    setStatus(engineReady ? 'engine + instrument ready' : 'engine FAILED');
+  } catch (e) {
+    setStatus('ERROR: ' + String(e)); log('startAudio threw: ' + String(e));
+  }
+};
+
+// ============================================================================
+// The generic plugin surface entry points (the E2a flow under test)
+// ============================================================================
+window.addEffect = async function (effectType) {
+  if (!engineReady) return null;
+  // `pluginType` — NOT `type` (a duplicate key would shadow the message
+  // discriminant; the worklet case reads msg.pluginType).
+  post({ type: 'add-plugin', trackId: E2A.track, pluginType: effectType });
+  const r = await waitFor('plugin-added');
+  if (r && r.rc === 0) eqAdded = true;
+  return r;
+};
+window.pluginInfo = async function () {
+  post({ type: 'plugin-params', trackId: E2A.track, pluginIdx: 0 });
+  const r = await waitFor('plugin-params');
+  if (r) { numParams = r.numParams; paramIds = r.paramIds; }
+  return r;
+};
+window.setParam = async function (paramId, value) {
+  post({ type: 'set-plugin-param', trackId: E2A.track, pluginIdx: 0,
+         paramId, value });
+  return await waitFor((r) => r.type === 'plugin-param-set' && r.paramId === paramId);
+};
+window.getParam = async function (paramId) {
+  post({ type: 'get-plugin-param', trackId: E2A.track, pluginIdx: 0, paramId });
+  const r = await waitFor((r) => r.type === 'plugin-param' && r.paramId === paramId);
+  return r ? r.value : null;   // null/NaN = miss
+};
+window.setBypass = async function (bypass) {
+  post({ type: 'set-plugin-bypass', trackId: E2A.track, pluginIdx: 0, bypass });
+  return await waitFor((r) => r.type === 'plugin-bypass-set' && !!r.bypass === !!bypass);
+};
+// --- the structural entry points (the remaining message flows) ---
+window.numPlugins = async function () {
+  post({ type: 'num-plugins', trackId: E2A.track });
+  const r = await waitFor('plugin-count');
+  return r ? r.numPlugins : null;
+};
+window.pluginTypeAt = async function (idx) {
+  post({ type: 'plugin-type', trackId: E2A.track, pluginIdx: idx });
+  const r = await waitFor((r) => r.type === 'plugin-type' && r.pluginIdx === idx);
+  return r ? r.pluginType : null;
+};
+window.removePlugin = async function (idx) {
+  post({ type: 'remove-plugin', trackId: E2A.track, pluginIdx: idx });
+  return await waitFor((r) => r.type === 'plugin-removed' && r.pluginIdx === idx);
+};
+window.movePlugin = async function (fromIdx, toIdx) {
+  post({ type: 'move-plugin', trackId: E2A.track, fromIdx, toIdx });
+  return await waitFor((r) => r.type === 'plugin-moved' && r.fromIdx === fromIdx && r.toIdx === toIdx);
+};
+window.setProperty = async function (prop, value, idx = 0) {
+  post({ type: 'set-plugin-property', trackId: E2A.track, pluginIdx: idx, prop, value });
+  return await waitFor((r) => r.type === 'plugin-property-set' && r.prop === prop && r.pluginIdx === idx);
+};
+window.getProperty = async function (prop, idx = 0) {
+  post({ type: 'get-plugin-property', trackId: E2A.track, pluginIdx: idx, prop });
+  const r = await waitFor((r) => r.type === 'plugin-property' && r.prop === prop && r.pluginIdx === idx);
+  return r ? r.value : null;
+};
+
+window.play = async function () { post({ type: 'transport-play' }); };
+window.stop = async function () { post({ type: 'transport-stop' }); };
+window.seek = async function (sec) { post({ type: 'seek', seconds: sec }); };
+
+// ============================================================================
+// Measurement taps (the phase10 pattern — the analyser is the waveform check)
+// ============================================================================
+window.tapRms = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(d);
+  let s = 0;
+  for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+  return Math.sqrt(s / d.length);
+};
+window.tapSpectrum = function () {
+  if (!analyser) return null;
+  const d = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(d);
+  let best = -Infinity, bi = -1;
+  for (let i = 1; i < d.length; i++) if (d[i] > best) { best = d[i]; bi = i; }
+  return { binHz: (bi * analyser.context.sampleRate) / analyser.fftSize, dB: best };
+};
+
+// ============================================================================
+// The test surface (window.__phaseE2a — the harness entry points)
+// ============================================================================
+window.__phaseE2a = {
+  state: () => ({ engineReady, audioRunning, numTracks, instrumentLoaded,
+                  noteScheduled, eqAdded, numParams, paramIds,
+                  analyser: !!analyser }),
+  startAudio: () => window.startAudio(),
+  addEffect: (t) => window.addEffect(t),
+  pluginInfo: () => window.pluginInfo(),
+  setParam: (id, v) => window.setParam(id, v),
+  getParam: (id) => window.getParam(id),
+  setBypass: (b) => window.setBypass(b),
+  numPlugins: () => window.numPlugins(),
+  pluginTypeAt: (i) => window.pluginTypeAt(i),
+  removePlugin: (i) => window.removePlugin(i),
+  movePlugin: (f, t) => window.movePlugin(f, t),
+  setProperty: (p, v, i) => window.setProperty(p, v, i),
+  getProperty: (p, i) => window.getProperty(p, i),
+  play: () => window.play(),
+  stop: () => window.stop(),
+  seek: (s) => window.seek(s),
+  tapRms: () => window.tapRms(),
+  tapSpectrum: () => window.tapSpectrum(),
+};
+
+document.getElementById('start').onclick = () => window.startAudio();
+document.getElementById('addeq').onclick = async () => {
+  const r = await window.addEffect('4bandEq');
+  log('add-plugin: ' + JSON.stringify(r));
+  const p = await window.pluginInfo();
+  log('plugin-params: ' + JSON.stringify(p));
+};
+document.getElementById('play').onclick = () => window.play();
+document.getElementById('cut').onclick = async () => {
+  const r1 = await window.setParam('Mid freq 1', 440.0);
+  const r2 = await window.setParam('Mid gain 1', -20.0);
+  const r3 = await window.setParam('Mid Q 1', 1.0);
+  log('live cut: ' + JSON.stringify([r1 && r1.rc, r2 && r2.rc, r3 && r3.rc]));
+};
+document.getElementById('byp').onclick = async () => {
+  const r = await window.setBypass(true);
+  log('bypass: ' + JSON.stringify(r));
+};
+document.getElementById('stop').onclick = () => window.stop();
+</script>
+</body>
+</html>
