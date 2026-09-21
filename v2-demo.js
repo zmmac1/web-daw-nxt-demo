@@ -1487,18 +1487,19 @@ const VERIFY = {
     // write cleanly. The TEST track also feeds V13's expectTracks (+1).
     const sc = await VERIFY._scratch();
     try {
-      await parkedPlay(0.5);               // inside the sine's 0–2 s span, settled
+      await parkedPlay(0.3);               // inside the sine's 0–2 s span with margin (R1b F4: background-tab timer clamping can stretch the reads — keep ≥0.4 s to the 2.0 s end)
       await sleep(300);
       const before = bandEnergyDb(440, 25).at;
       post({ type: 'set-track-volume', trackId: sc.tid, gain: dbToLin(-20) });  // LINEAR contract
-      await sleep(400);
+      await sleep(300);
       const after = bandEnergyDb(440, 25).at;
-      post({ type: 'set-track-volume', trackId: sc.tid, gain: 1.0 });
-      await stopTransport();
       const ratio = Math.pow(10, (after - before) / 20);
       const m = `440 Hz scratch sine −20 dB live write: ${before.toFixed(1)} → ${after.toFixed(1)} dB · ratio ${ratio.toFixed(3)}`;
       return { pass: ratio >= 0.06 && ratio <= 0.16, measured: m };
-    } finally { await VERIFY._unscratch(); }
+    } finally {
+      post({ type: 'set-track-volume', trackId: sc.tid, gain: 1.0 });   // R1b F2: in the finally — a throw mid-test must not leak the duck onto the persistent TEST track
+      await VERIFY._unscratch();
+    }
   },
   async V5() {
     // the E2f fix: the Keys band after a mute→unmute cycle must match the clean render.
@@ -1565,7 +1566,8 @@ const VERIFY = {
     post({ type: 'set-aux-send-gain', trackId: K, sendIdx: 0, gainDb: 0 });
     post({ type: 'set-track-volume', trackId: K, gain: dbToLin(-30) });   // bury the dry + its release
     await sleep(350);
-    const preA = bandEnergyDb(f);
+    try {                                   // R1b F1: an exception mid-legs must not leak the duck/-90 send into V5/V6/V13 + the user's mix
+      const preA = bandEnergyDb(f);
     pianoNoteOn(64, 100);
     await sleep(1100);
     const duringA = bandEnergyDb(f);       // the wet path alone (send pre-fader)
@@ -1582,12 +1584,14 @@ const VERIFY = {
     pianoNoteOff(64);
     const tailB = [0, 0, 0];
     for (let i = 0; i < 3; i++) { await sleep(450); tailB[i] = bandEnergyDb(f).at; }
-    post({ type: 'set-track-volume', trackId: K, gain: 1.0 });            // restore
-    post({ type: 'set-aux-send-gain', trackId: K, sendIdx: 0, gainDb: -10 });  // the musical level
     let wet = -Infinity, wetAt = 0;
     for (let i = 0; i < 3; i++) { const d = tailA[i] - tailB[i]; if (d > wet) { wet = d; wetAt = 450 * (i + 1); } }
     const m = `ring Δ ${wet.toFixed(1)} dB @ +${wetAt} ms (A ${tailA.map((v) => v.toFixed(0)).join('/')} vs floor ${tailB.map((v) => v.toFixed(0)).join('/')}) · wet-during ${duringA.at.toFixed(1)} vs dry-ducked ${duringB.at.toFixed(1)} · pre ${preA.at.toFixed(1)}/${preB.at.toFixed(1)} dB`;
     return { pass: (duringA.at - preA.at >= 10) && wet >= 6, measured: m };
+    } finally {                              // R1b F1: restores on EVERY path
+      post({ type: 'set-track-volume', trackId: K, gain: 1.0 });            // restore
+      post({ type: 'set-aux-send-gain', trackId: K, sendIdx: 0, gainDb: -10 });  // the musical level
+    }
   },
   // V8/V9 share ONE scratch track + a timing-fixed leg helper: the
   // (dominant frequency, content end) PAIR is the discriminator — the
@@ -1783,27 +1787,31 @@ const VERIFY = {
     // keyboard was DEAD without this).
     const busNp = await ask('num-plugins', { trackId: state.bus.trackId }, 'plugin-count', 4000, (m) => m.trackId === state.bus.trackId);
     let irRestored = 'present';
-    if (!busNp || busNp.numPlugins === 0) {
-      const ap = await ask('add-plugin', { trackId: state.bus.trackId, pluginType: 'impulseResponse' }, 'plugin-added', 8000, (m) => m.trackId === state.bus.trackId);
-      if (!ap || ap.rc !== 0) throw new Error('bus IR re-add failed');
-      const irCopy2 = state.irWav.slice(0);   // keep the original for the NEXT round-trip
-      post({ type: 'ir-load-data', trackId: state.bus.trackId, pluginIdx: 0, bytes: irCopy2 }, [irCopy2]);
-      const ir2 = await waitFor('ir-loaded', 15000, (m) => m.trackId === state.bus.trackId);
-      if (!ir2 || ir2.rc !== 0) throw new Error('IR re-load failed rc=' + (ir2 && ir2.rc));
-      irRestored = 're-added';
-    }
+    try {
+      if (!busNp || busNp.numPlugins === 0) {
+        const ap = await ask('add-plugin', { trackId: state.bus.trackId, pluginType: 'impulseResponse' }, 'plugin-added', 8000, (m) => m.trackId === state.bus.trackId);
+        if (!ap || ap.rc !== 0) throw new Error('bus IR re-add rc=' + (ap && ap.rc));
+        const irCopy2 = state.irWav.slice(0);   // keep the original for the NEXT round-trip
+        post({ type: 'ir-load-data', trackId: state.bus.trackId, pluginIdx: 0, bytes: irCopy2 }, [irCopy2]);
+        const ir2 = await waitFor('ir-loaded', 15000, (m) => m.trackId === state.bus.trackId);
+        if (!ir2 || ir2.rc !== 0) throw new Error('IR re-load rc=' + (ir2 && ir2.rc));
+        irRestored = 're-added';
+      }
+    } catch (e) { irRestored = 'FAILED:' + String(e && e.message || e); }   // R1b F3: report, don't strand the rewire
     const keysNp = await ask('num-plugins', { trackId: laneT('Keys') }, 'plugin-count', 4000, (m) => m.trackId === laneT('Keys'));
     let eqRestored = 'present';
-    if (!keysNp || keysNp.numPlugins === 0) {
-      const aq = await ask('add-plugin', { trackId: laneT('Keys'), pluginType: '4bandEq' }, 'plugin-added', 8000, (m) => m.trackId === laneT('Keys'));
-      if (!aq || aq.rc !== 0) throw new Error('Keys EQ re-add failed');
-      for (const pt of state.curve.points) {
-        post({ type: 'automation-add-point', trackId: laneT('Keys'), pluginIdx: 0, paramId: AU.paramId, t: pt.t, v: pt.v, c: pt.c });
+    try {
+      if (!keysNp || keysNp.numPlugins === 0) {
+        const aq = await ask('add-plugin', { trackId: laneT('Keys'), pluginType: '4bandEq' }, 'plugin-added', 8000, (m) => m.trackId === laneT('Keys'));
+        if (!aq || aq.rc !== 0) throw new Error('Keys EQ re-add rc=' + (aq && aq.rc));
+        for (const pt of state.curve.points) {
+          post({ type: 'automation-add-point', trackId: laneT('Keys'), pluginIdx: 0, paramId: AU.paramId, t: pt.t, v: pt.v, c: pt.c });
+        }
+        await sleep(200);
+        eqRestored = 're-added';
       }
-      await sleep(200);
-      eqRestored = 're-added';
-    }
-    // live-input re-wiring (the phase-9 contract: select THEN enable)
+    } catch (e) { eqRestored = 'FAILED:' + String(e && e.message || e); }
+    // live-input re-wiring (the phase-9 contract: select THEN enable) — ALWAYS runs (R1b F3)
     const liveTarget = Number($('kb-target').value) || laneT('Keys');
     post({ type: 'select-input-track', trackId: liveTarget });
     await sleep(80);
@@ -1816,6 +1824,7 @@ const VERIFY = {
     await stopTransport();
     const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB · post-reload FX: IR ${irRestored} · Keys EQ ${eqRestored}`;
     const ok = hasSfizz && hasWave && nt && nt.numTracks === expectTracks && wc && wc.num === EXPECT.waveClipsT0
+      && !String(irRestored).startsWith('FAILED') && !String(eqRestored).startsWith('FAILED')   // R1b F3: a failed mitigation = a failed round-trip
       && lk && lk.numRegions === EXPECT.epRegions && lb && lb.numRegions === EXPECT.bassRegions
       && (band.at - band.neighbor >= 6);
     return { pass: !!ok, measured: m };
