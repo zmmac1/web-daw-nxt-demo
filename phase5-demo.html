@@ -253,7 +253,7 @@
         audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: 48000 });
 
         log('Adding AudioWorklet module...');
-        await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+        await audioCtx.audioWorklet.addModule('wasm/phase5-processor.js');
         log('AudioWorklet loaded');
 
         workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
@@ -290,7 +290,7 @@
         };
 
         log('Fetching WASM binary...');
-        const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm');
+        const wasmResp = await fetch('wasm/tracktion_engine_wasm.wasm');
         const wasmBinary = await wasmResp.arrayBuffer();
         log(`WASM fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
         workletNode.port.postMessage({ type: 'init-wasm', wasmBinary }, [wasmBinary]);

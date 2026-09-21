@@ -338,7 +338,7 @@ window.startAudio = async function () {
     setError(null);
     log('Creating AudioContext…');
     audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
-    await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+    await audioCtx.audioWorklet.addModule('wasm/phase5-processor.js');
     log('AudioWorklet loaded');
 
     workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
@@ -353,7 +353,7 @@ window.startAudio = async function () {
     // Cache-buster: the phase8 test runs cached this URL with the OLD binary,
     // which made every Phase 9 export silently missing in the worklet (the
     // add-track case fell through without a warn — fixed below too).
-    const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmResp = await fetch('wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
     const wasmBinary = await wasmResp.arrayBuffer();
     log(`WASM fetched (${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB)`);
     // deferLiveInput: the input target is selected (select-input-track) in

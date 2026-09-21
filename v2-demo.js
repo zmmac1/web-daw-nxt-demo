@@ -331,7 +331,7 @@ async function bootAudio() {
   if (engineReady) return true;
   const Ctor = window.AudioContext || window.webkitAudioContext;
   audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
-  await audioCtx.audioWorklet.addModule('/wasm/phase5-processor.js');
+  await audioCtx.audioWorklet.addModule('wasm/phase5-processor.js');
   workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
     numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
   });
@@ -340,7 +340,7 @@ async function bootAudio() {
   fftBuf = new Float32Array(analyser.frequencyBinCount);   // allocated HERE — bandEnergyDb needs it before any tab opens
   workletNode.connect(audioCtx.destination);
   workletNode.port.onmessage = (e) => routeReply(e.data);
-  const wasmResp = await fetch('/wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+  const wasmResp = await fetch('wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
   const wasmBinary = await wasmResp.arrayBuffer();
   recordWarn(`wasm fetched (${(wasmBinary.byteLength / 1048576).toFixed(2)} MB)`);
   post({ type: 'init-wasm', wasmBinary, instrument: 'none', loadMelody: false, deferLiveInput: true });
