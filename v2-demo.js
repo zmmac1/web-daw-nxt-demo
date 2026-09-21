@@ -1632,8 +1632,10 @@ const VERIFY = {
     return state.scratch;
   },
   async _unscratch() {
+    await stopTransport();                  // ALWAYS stopped before the structural delete (the 2026-09-21 undead-clip bug: a delete-while-playing fails the pre-play guard, and a waitFor matching on itemId alone "succeeds" over the rc=-4 reply — the clip survived and poisoned V8's legs)
     post({ type: 'delete-clip', itemId: state.scratch.itemId });
-    await waitFor('clip-deleted', 5000, (m) => Number(m.itemId) === state.scratch.itemId);
+    const dl = await waitFor('clip-deleted', 5000, (m) => Number(m.itemId) === state.scratch.itemId);
+    if (!dl || dl.result !== 0) throw new Error('scratch clip delete failed result=' + (dl && dl.result));
     post({ type: 'set-track-mute', trackId: DRUMS(), mute: false });
     post({ type: 'set-folder-mute', folderId: state.folder.folderId, mute: false });
     post({ type: 'set-track-mute', trackId: state.bus.trackId, mute: false });
