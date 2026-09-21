@@ -1493,6 +1493,7 @@ const VERIFY = {
       post({ type: 'set-track-volume', trackId: sc.tid, gain: dbToLin(-20) });  // LINEAR contract
       await sleep(300);
       const after = bandEnergyDb(440, 25).at;
+      await stopTransport();                // stop INSIDE the try (the suite10 shape): _unscratch's delete lands on a fully-stopped engine (belt-and-braces with its own stop)
       const ratio = Math.pow(10, (after - before) / 20);
       const m = `440 Hz scratch sine −20 dB live write: ${before.toFixed(1)} → ${after.toFixed(1)} dB · ratio ${ratio.toFixed(3)}`;
       return { pass: ratio >= 0.06 && ratio <= 0.16, measured: m };
