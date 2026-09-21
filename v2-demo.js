@@ -1664,6 +1664,14 @@ const VERIFY = {
       post({ type: 'set-wave-clip-speed', trackId: sc.tid, clipIdx: sc.clipIdx, ratio: 2.0 });
       const sr = await waitFor('wave-clip-speed-set', 4000, (m) => m.clipIdx === sc.clipIdx);
       if (!sr || sr.rc !== 0) throw new Error('speed rc=' + (sr && sr.rc));
+      // PUMP-CYCLE (the 2026-09-21 public-URL finding): rc=0 means the write
+      // was ACCEPTED — the graph rebuild (the stretcher selection) is ASYNC
+      // and pump-gated (the §6l class); a measured leg starting immediately
+      // can render the UNstretched clip (ratio 1.000, twice on the public
+      // deployment). One park+play+stop cycle delivers the rebuild.
+      await parkedPlay(0.05);
+      await stopTransport();
+      await sleep(300);
       const leg2 = await VERIFY._stretchLeg(300, 1400);
       post({ type: 'set-wave-clip-speed', trackId: sc.tid, clipIdx: sc.clipIdx, ratio: 1.0 });
       await waitFor('wave-clip-speed-set', 4000, (m) => m.clipIdx === sc.clipIdx);
@@ -1681,6 +1689,9 @@ const VERIFY = {
       post({ type: 'set-wave-clip-pitch', trackId: sc.tid, clipIdx: sc.clipIdx, semitones: 5 });
       const pr = await waitFor('wave-clip-pitch-set', 4000, (m) => m.clipIdx === sc.clipIdx);
       if (!pr || pr.rc !== 0) throw new Error('pitch rc=' + (pr && pr.rc));
+      await parkedPlay(0.05);   // the same pump-cycle as V8 — the STFT path shares the async-rebuild class
+      await stopTransport();
+      await sleep(300);
       const leg2 = await VERIFY._stretchLeg(300, 1200);
       post({ type: 'set-wave-clip-pitch', trackId: sc.tid, clipIdx: sc.clipIdx, semitones: 0 });
       await waitFor('wave-clip-pitch-set', 4000, (m) => m.clipIdx === sc.clipIdx);
