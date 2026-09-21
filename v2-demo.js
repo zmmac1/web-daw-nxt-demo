@@ -1835,10 +1835,14 @@ const VF_META = [
   ['V1', 'engine + arrangement introspection', 'counts vs the expected shape'],
   ['V2', 'sfizz chord renders', 'Em pad bands vs neighbours'],
   ['V3', 'live keyboard → sfizz', 'E4 note band'],
-  ['V4', 'track volume LIVE', '−20 dB write, band ratio'],
+  // ORDER (the 2026-09-21 finding): V7 runs BEFORE V4/V8/V9 — the scratch
+  // tests' bus MUTE-CYCLE kills the IR's post-release ring irreversibly
+  // (convolution DURING input survives; the tail after input-stop dies —
+  // the E2f-adjacent class, now in the engine ledger).
+  ['V7', 'IR reverb tail', 'post-release wet vs dry delta'],
+  ['V4', 'track volume LIVE', '−20 dB write on the scratch sine'],
   ['V5', 'mute/unmute CLEAN (the E2f fix)', 'pre vs post-unmute band'],
   ['V6', 'master EQ mid-cut toggle', 'G4 band dip, LIVE write'],
-  ['V7', 'IR reverb tail', 'post-release tail vs floor'],
   ['V8', 'varispeed physics (E4e)', 'sine ×2: freq + content end'],
   ['V9', 'pitch STFT (E4c)', 'sine +5 st: freq, duration kept'],
   ['V10', 'bounce ≈ live', 'file RMS vs played RMS'],
