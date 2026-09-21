@@ -1441,8 +1441,9 @@ const VERIFY = {
     const hz2 = await ask('has-sfizz', { trackId: laneT('Bass') }, 'sfizz-status', 4000, (m) => m.trackId === laneT('Bass'));
     const rg1 = await ask('sfizz-num-regions', { trackId: laneT('Keys') }, 'sfizz-region-count', 4000, (m) => m.trackId === laneT('Keys'));
     const rg2 = await ask('sfizz-num-regions', { trackId: laneT('Bass') }, 'sfizz-region-count', 4000, (m) => m.trackId === laneT('Bass'));
-    const m = `tracks ${nt && nt.numTracks} · waveClips ${wc && wc.num} · midiClips ${c1 && c1.count}/${c2 && c2.count} · plugins(Keys/Master/Bus) ${np1 && np1.numPlugins}/${npM && npM.numPlugins}/${npB && npB.numPlugins} · sfizz ${hz1 && hz1.hasSfizz}/${hz2 && hz2.hasSfizz} · regions ${rg1 && rg1.numRegions}/${rg2 && rg2.numRegions}`;
-    const ok = nt && nt.numTracks === EXPECT.numTracks && wc && wc.num === EXPECT.waveClipsT0
+    const ntExpect = EXPECT.numTracks + (state.scratch ? 1 : 0);   // the scratch track may pre-exist (a standalone V4/V8/V9 ran first)
+    const m = `tracks ${nt && nt.numTracks}/${ntExpect} · waveClips ${wc && wc.num} · midiClips ${c1 && c1.count}/${c2 && c2.count} · plugins(Keys/Master/Bus) ${np1 && np1.numPlugins}/${npM && npM.numPlugins}/${npB && npB.numPlugins} · sfizz ${hz1 && hz1.hasSfizz}/${hz2 && hz2.hasSfizz} · regions ${rg1 && rg1.numRegions}/${rg2 && rg2.numRegions}`;
+    const ok = nt && nt.numTracks === ntExpect && wc && wc.num === EXPECT.waveClipsT0
       && c1 && c1.count === 1 && c2 && c2.count === 1
       && np1 && np1.numPlugins === EXPECT.pluginsT1 && npM && npM.numPlugins === EXPECT.pluginsMaster
       && npB && npB.numPlugins === EXPECT.pluginsBus
@@ -1565,7 +1566,7 @@ const VERIFY = {
     await sleep(1100);
     const duringA = bandEnergyDb(f);
     pianoNoteOff(64);
-    await sleep(550);                     // inside the ring's proven window
+    await sleep(300);                     // INSIDE every observed ring (the ring's death varies with module state: fresh -38@831ms, post-scratch -86@550ms)
     const tailA = bandEnergyDb(f);        // EP release + IR ring
     await sleep(1500);                    // let the ring fully decay
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -90 });
@@ -1575,7 +1576,7 @@ const VERIFY = {
     await sleep(1100);
     const duringB = bandEnergyDb(f);
     pianoNoteOff(64);
-    await sleep(550);
+    await sleep(300);
     const tailB = bandEnergyDb(f);        // the dry EP release alone
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });  // the musical level
     const wet = tailA.at - tailB.at;
