@@ -228,6 +228,8 @@
           <li><b>Clip-gain sawtooth:</b> a live clip-gain write class shows a restart sawtooth (§6g.4) — the gain slider is stopped-only.</li>
           <li><b>Field names:</b> the automation payload rides <code>t / v / c</code> (the worklet's reads) — the phase-exit demo's <code>tSec/value/curve</code> was a transcribed bug (R1-P0-4) and is NOT copied here.</li>
           <li><b>Realtime safety:</b> the browser's own output path can hide small glitches the engine's drop counters still see (and vice-versa for output-device dropouts) — V14 prints the caveat.</li>
+          <li><b>XML round-trip drops bus FX (2026-09-21):</b> save-edit-xml → load-edit-xml serializes the bus's <code>auxreturn</code> + <code>impulseResponse</code> plugins and the Keys 4bandEq, but the loader restores none of them. V13 re-adds the IR + the EQ + their data (page-side mitigation); the <code>auxreturn</code> is not flat-API-addable, so the reverb send path stays dead after an in-session reload until the engine-side fix. Engine ledger: reload-restore gap.</li>
+          <li><b>Browser IR tail (2026-09-21):</b> the reverb's post-release ring measures ~−85 dB on the browser path while the native harness measured the full τ = 0.35 s e-fold — the browser ring collapses ~50 dB faster (the wet contribution DURING notes is unaffected — the +30 dB A/B in V7). Recorded as a render-path divergence; V7 gates the wet delta, not the native envelope.</li>
         </ul>
       </div>
       <div>

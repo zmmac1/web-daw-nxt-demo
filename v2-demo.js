@@ -1552,12 +1552,15 @@ const VERIFY = {
     await sleep(900);
     pianoNoteOff(60);
     await sleep(500);
-    // TWO-LEG DISCRIMINATOR (the 2026-09-21 public-URL finding): the tail
-    // read at +0.9 s sat ON the ring's cliff edge (measured: -38 dB at
-    // +831 ms, floor by +1.2 s) — localhost timing caught the ring, the
-    // public deployment fell past it. Now: read INSIDE the ring (+550 ms)
-    // and subtract the dry EP's own release (leg B, send killed) — the
-    // PASS bar is the WET delta, not an absolute level.
+    // TWO-LEG + MULTI-OFFSET DISCRIMINATOR (the 2026-09-21 public-URL saga):
+    // the browser-path IR ring sits at ~-85 dB (a RECORDED divergence — the
+    // native harness measured the full τ = 0.35 s e-fold; the browser ring
+    // collapses ~50 dB faster) while the dry EP release's death time VARIES
+    // with module state (still -88 at +300 ms in one run, floor by +550 in
+    // another — it polluted both legs equally and zeroed the delta). Read
+    // THREE offsets per leg and take the MAX delta: at whichever offset the
+    // release has died, the ring stands alone above the floor (observed
+    // Δ ≈ 25 dB at +550 ms when the release was gone).
     const f = 329.63;
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: 0 });
     await sleep(250);
@@ -1566,9 +1569,9 @@ const VERIFY = {
     await sleep(1100);
     const duringA = bandEnergyDb(f);
     pianoNoteOff(64);
-    await sleep(300);                     // INSIDE every observed ring (the ring's death varies with module state: fresh -38@831ms, post-scratch -86@550ms)
-    const tailA = bandEnergyDb(f);        // EP release + IR ring
-    await sleep(1500);                    // let the ring fully decay
+    const tailA = [0, 0, 0];
+    for (let i = 0; i < 3; i++) { await sleep(450); tailA[i] = bandEnergyDb(f).at; }   // reads at +450/+900/+1350 ms
+    await sleep(600);                      // let the ring fully decay
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -90 });
     await sleep(300);
     const preB = bandEnergyDb(f);
@@ -1576,11 +1579,12 @@ const VERIFY = {
     await sleep(1100);
     const duringB = bandEnergyDb(f);
     pianoNoteOff(64);
-    await sleep(300);
-    const tailB = bandEnergyDb(f);        // the dry EP release alone
+    const tailB = [0, 0, 0];
+    for (let i = 0; i < 3; i++) { await sleep(450); tailB[i] = bandEnergyDb(f).at; }
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });  // the musical level
-    const wet = tailA.at - tailB.at;
-    const m = `wet tail (send 0 dB) ${tailA.at.toFixed(1)} vs dry tail (send −90) ${tailB.at.toFixed(1)} · wet Δ ${wet.toFixed(1)} dB · during ${duringA.at.toFixed(1)}/${duringB.at.toFixed(1)} · pre ${preA.at.toFixed(1)}/${preB.at.toFixed(1)} dB`;
+    let wet = -Infinity, wetAt = 0;
+    for (let i = 0; i < 3; i++) { const d = tailA[i] - tailB[i]; if (d > wet) { wet = d; wetAt = 450 * (i + 1); } }
+    const m = `wet tail Δ ${wet.toFixed(1)} dB @ +${wetAt} ms (reads A ${tailA.map((v) => v.toFixed(0)).join('/')} vs B ${tailB.map((v) => v.toFixed(0)).join('/')}) · during ${duringA.at.toFixed(1)}/${duringB.at.toFixed(1)} · pre ${preA.at.toFixed(1)}/${preB.at.toFixed(1)} dB`;
     return { pass: (duringA.at - preA.at >= 10) && wet >= 6, measured: m };
   },
   // V8/V9 share ONE scratch track + a timing-fixed leg helper: the
