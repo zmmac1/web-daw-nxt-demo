@@ -1536,21 +1536,43 @@ const VERIFY = {
   },
   async V7() {
     await stopTransport();
-    // boost the send for the tail test (the musical −10 dB send leaves the
-    // tail under the floor bar — the τ 0.35 s ring at 2.6τ is −23 dB already)
+    // WARMUP: the first sfizz note on a fresh engine is absorbed by the
+    // freewheeling load (the E1 lesson — a fresh-build V7 measured floor
+    // at -140 dB on all legs before this).
+    pianoNoteOn(60, 100);
+    await sleep(900);
+    pianoNoteOff(60);
+    await sleep(500);
+    // TWO-LEG DISCRIMINATOR (the 2026-09-21 public-URL finding): the tail
+    // read at +0.9 s sat ON the ring's cliff edge (measured: -38 dB at
+    // +831 ms, floor by +1.2 s) — localhost timing caught the ring, the
+    // public deployment fell past it. Now: read INSIDE the ring (+550 ms)
+    // and subtract the dry EP's own release (leg B, send killed) — the
+    // PASS bar is the WET delta, not an absolute level.
+    const f = 329.63;
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: 0 });
     await sleep(250);
-    const f = 329.63;
-    const pre = bandEnergyDb(f);
+    const preA = bandEnergyDb(f);
     pianoNoteOn(64, 100);
     await sleep(1100);
-    const during = bandEnergyDb(f);
+    const duringA = bandEnergyDb(f);
     pianoNoteOff(64);
-    await sleep(900);                      // the IR tail (τ 0.35 s) at 2.6τ — audible past the EP's own decay
-    const tail = bandEnergyDb(f);
-    post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });
-    const m = `pre ${pre.at.toFixed(1)} · during ${during.at.toFixed(1)} · tail(+0.9 s) ${tail.at.toFixed(1)} dB (send 0 dB for the test)`;
-    return { pass: (during.at - pre.at >= 10) && (tail.at - pre.at >= 6), measured: m };
+    await sleep(550);                     // inside the ring's proven window
+    const tailA = bandEnergyDb(f);        // EP release + IR ring
+    await sleep(1500);                    // let the ring fully decay
+    post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -90 });
+    await sleep(300);
+    const preB = bandEnergyDb(f);
+    pianoNoteOn(64, 100);
+    await sleep(1100);
+    const duringB = bandEnergyDb(f);
+    pianoNoteOff(64);
+    await sleep(550);
+    const tailB = bandEnergyDb(f);        // the dry EP release alone
+    post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });  // the musical level
+    const wet = tailA.at - tailB.at;
+    const m = `wet tail (send 0 dB) ${tailA.at.toFixed(1)} vs dry tail (send −90) ${tailB.at.toFixed(1)} · wet Δ ${wet.toFixed(1)} dB · during ${duringA.at.toFixed(1)}/${duringB.at.toFixed(1)} · pre ${preA.at.toFixed(1)}/${preB.at.toFixed(1)} dB`;
+    return { pass: (duringA.at - preA.at >= 10) && wet >= 6, measured: m };
   },
   // V8/V9 share ONE scratch track + a timing-fixed leg helper: the
   // (dominant frequency, content end) PAIR is the discriminator — the
@@ -1737,13 +1759,47 @@ const VERIFY = {
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });
     post({ type: 'set-folder-volume-db', folderId: state.folder.folderId, db: -10 });
     await sleep(250);
+    // RE-APPLY THE NON-SERIALIZING SURFACE (the 2026-09-21 public-URL
+    // finding): the XML round-trip DROPS the bus's auxreturn+impulseResponse
+    // plugins and the Keys 4bandEq (the loader restores [sfizz] but not the
+    // FX chain — the serialized PLUGIN nodes for bus FX and the EQ do not
+    // deserialize). Re-add + re-feed, then re-wire the live input (the
+    // reload also resets the worklet's routing target — the post-suite
+    // keyboard was DEAD without this).
+    const busNp = await ask('num-plugins', { trackId: state.bus.trackId }, 'plugin-count', 4000, (m) => m.trackId === state.bus.trackId);
+    let irRestored = 'present';
+    if (!busNp || busNp.numPlugins === 0) {
+      const ap = await ask('add-plugin', { trackId: state.bus.trackId, pluginType: 'impulseResponse' }, 'plugin-added', 8000, (m) => m.trackId === state.bus.trackId);
+      if (!ap || ap.rc !== 0) throw new Error('bus IR re-add failed');
+      const irCopy2 = state.irWav.slice(0);   // keep the original for the NEXT round-trip
+      post({ type: 'ir-load-data', trackId: state.bus.trackId, pluginIdx: 0, bytes: irCopy2 }, [irCopy2]);
+      const ir2 = await waitFor('ir-loaded', 15000, (m) => m.trackId === state.bus.trackId);
+      if (!ir2 || ir2.rc !== 0) throw new Error('IR re-load failed rc=' + (ir2 && ir2.rc));
+      irRestored = 're-added';
+    }
+    const keysNp = await ask('num-plugins', { trackId: laneT('Keys') }, 'plugin-count', 4000, (m) => m.trackId === laneT('Keys'));
+    let eqRestored = 'present';
+    if (!keysNp || keysNp.numPlugins === 0) {
+      const aq = await ask('add-plugin', { trackId: laneT('Keys'), pluginType: '4bandEq' }, 'plugin-added', 8000, (m) => m.trackId === laneT('Keys'));
+      if (!aq || aq.rc !== 0) throw new Error('Keys EQ re-add failed');
+      for (const pt of state.curve.points) {
+        post({ type: 'automation-add-point', trackId: laneT('Keys'), pluginIdx: 0, paramId: AU.paramId, t: pt.t, v: pt.v, c: pt.c });
+      }
+      await sleep(200);
+      eqRestored = 're-added';
+    }
+    // live-input re-wiring (the phase-9 contract: select THEN enable)
+    const liveTarget = Number($('kb-target').value) || laneT('Keys');
+    post({ type: 'select-input-track', trackId: liveTarget });
+    await sleep(80);
+    post({ type: 'enable-live-input' });
     const nt = await ask('num-tracks', null, 'track-count', 4000);
     const wc = await ask('num-wave-clips', { trackId: DRUMS() }, 'num-wave-clips', 4000, (m) => m.trackId === DRUMS());
     await parkedPlay(0.1);
     await sleep(900);
     const band = bandEnergyDb(164.81);
     await stopTransport();
-    const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB`;
+    const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB · post-reload FX: IR ${irRestored} · Keys EQ ${eqRestored}`;
     const ok = hasSfizz && hasWave && nt && nt.numTracks === expectTracks && wc && wc.num === EXPECT.waveClipsT0
       && lk && lk.numRegions === EXPECT.epRegions && lb && lb.numRegions === EXPECT.bassRegions
       && (band.at - band.neighbor >= 6);
