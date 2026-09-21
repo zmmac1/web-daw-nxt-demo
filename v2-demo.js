@@ -1477,8 +1477,14 @@ const VERIFY = {
   async V4() {
     // duck the send WHILE STOPPED (the note's τ=0.45 s decay means late
     // windows read the tail — measure EARLY, inside the first ~1.2 s of bar 1)
+    // ISOLATION (the 2026-09-21 public-URL finding): a single 350 ms read
+    // can land on a drum transient or the bass's 4th harmonic (= E4 EXACTLY,
+    // 82.41 × 4 = 329.63) — the un-isolated duck measured only −7.7 dB
+    // (ratio 0.418). Mute the bleed sources for the window; restore after.
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -60 });
-    await sleep(200);
+    post({ type: 'set-track-mute', trackId: laneT('Drums'), mute: true });
+    post({ type: 'set-track-mute', trackId: laneT('Bass'), mute: true });
+    await sleep(250);
     await parkedPlay(0.1);
     await sleep(150);
     const before = bandEnergyDb(329.63).at;
@@ -1487,6 +1493,8 @@ const VERIFY = {
     const after = bandEnergyDb(329.63).at;
     post({ type: 'set-track-volume', trackId: laneT('Keys'), gain: 1.0 });
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });
+    post({ type: 'set-track-mute', trackId: laneT('Drums'), mute: false });
+    post({ type: 'set-track-mute', trackId: laneT('Bass'), mute: false });
     await stopTransport();
     const ratio = Math.pow(10, (after - before) / 20);
     const m = `E4 dry band −20 dB live write: ${before.toFixed(1)} → ${after.toFixed(1)} dB · ratio ${ratio.toFixed(3)}`;
