@@ -1475,34 +1475,29 @@ const VERIFY = {
     return { pass: (dur.at - pre.at >= 6), measured: m };
   },
   async V4() {
-    // duck the send WHILE STOPPED (the note's τ=0.45 s decay means late
-    // windows read the tail — measure EARLY, inside the first ~1.2 s of bar 1)
-    // ISOLATION + STABLE CARRIER (the 2026-09-21 public-URL findings):
-    // (a) a single 350 ms read can land on a drum transient or the bass's
-    //     4th harmonic (= E4 EXACTLY, 82.41 × 4 = 329.63) — mute the bleed
-    //     sources for the window, restore after;
-    // (b) bar 1's pad has a RISING envelope (measured −49 → −38 across one
-    //     play — the −20 dB duck rode an +11 dB ramp and read −2.2 dB) —
-    //     park at 3.0 s = MID bar 2 (the C chord), where the control run
-    //     reads flat (−38 → −46 across the whole bar).
-    post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -60 });
-    post({ type: 'set-track-mute', trackId: laneT('Drums'), mute: true });
-    post({ type: 'set-track-mute', trackId: laneT('Bass'), mute: true });
-    await sleep(250);
-    await parkedPlay(3.0);
-    await sleep(150);
-    const before = bandEnergyDb(329.63).at;
-    post({ type: 'set-track-volume', trackId: laneT('Keys'), gain: dbToLin(-20) });  // LINEAR contract
-    await sleep(350);
-    const after = bandEnergyDb(329.63).at;
-    post({ type: 'set-track-volume', trackId: laneT('Keys'), gain: 1.0 });
-    post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -10 });
-    post({ type: 'set-track-mute', trackId: laneT('Drums'), mute: false });
-    post({ type: 'set-track-mute', trackId: laneT('Bass'), mute: false });
-    await stopTransport();
-    const ratio = Math.pow(10, (after - before) / 20);
-    const m = `E4 dry band −20 dB live write: ${before.toFixed(1)} → ${after.toFixed(1)} dB · ratio ${ratio.toFixed(3)}`;
-    return { pass: ratio >= 0.06 && ratio <= 0.16, measured: m };
+    // THE SCRATCH-SINE CARRIER (the 2026-09-21 public-URL saga): the Keys
+    // pad proved UNRELIABLE as a live-write carrier — bar 1 has a rising
+    // envelope (−49 → −38 across one play), the level varies play-to-play,
+    // and drum transients + the bass's 4th harmonic (= E4 EXACTLY,
+    // 82.41 × 4 = 329.63) bleed into the band — three separate failure
+    // modes observed before this rewrite. The scratch 440 Hz sine (the
+    // V8/V9 carrier, deterministic every run) with _scratch's full
+    // isolation (drums + folder + bus muted) measures the LIVE fader
+    // write cleanly. The TEST track also feeds V13's expectTracks (+1).
+    const sc = await VERIFY._scratch();
+    try {
+      await parkedPlay(0.5);               // inside the sine's 0–2 s span, settled
+      await sleep(300);
+      const before = bandEnergyDb(440, 25).at;
+      post({ type: 'set-track-volume', trackId: sc.tid, gain: dbToLin(-20) });  // LINEAR contract
+      await sleep(400);
+      const after = bandEnergyDb(440, 25).at;
+      post({ type: 'set-track-volume', trackId: sc.tid, gain: 1.0 });
+      await stopTransport();
+      const ratio = Math.pow(10, (after - before) / 20);
+      const m = `440 Hz scratch sine −20 dB live write: ${before.toFixed(1)} → ${after.toFixed(1)} dB · ratio ${ratio.toFixed(3)}`;
+      return { pass: ratio >= 0.06 && ratio <= 0.16, measured: m };
+    } finally { await VERIFY._unscratch(); }
   },
   async V5() {
     // the E2f fix: the Keys band after a mute→unmute cycle must match the clean render.
