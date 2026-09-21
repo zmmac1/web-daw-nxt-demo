@@ -1477,15 +1477,19 @@ const VERIFY = {
   async V4() {
     // duck the send WHILE STOPPED (the note's τ=0.45 s decay means late
     // windows read the tail — measure EARLY, inside the first ~1.2 s of bar 1)
-    // ISOLATION (the 2026-09-21 public-URL finding): a single 350 ms read
-    // can land on a drum transient or the bass's 4th harmonic (= E4 EXACTLY,
-    // 82.41 × 4 = 329.63) — the un-isolated duck measured only −7.7 dB
-    // (ratio 0.418). Mute the bleed sources for the window; restore after.
+    // ISOLATION + STABLE CARRIER (the 2026-09-21 public-URL findings):
+    // (a) a single 350 ms read can land on a drum transient or the bass's
+    //     4th harmonic (= E4 EXACTLY, 82.41 × 4 = 329.63) — mute the bleed
+    //     sources for the window, restore after;
+    // (b) bar 1's pad has a RISING envelope (measured −49 → −38 across one
+    //     play — the −20 dB duck rode an +11 dB ramp and read −2.2 dB) —
+    //     park at 3.0 s = MID bar 2 (the C chord), where the control run
+    //     reads flat (−38 → −46 across the whole bar).
     post({ type: 'set-aux-send-gain', trackId: laneT('Keys'), sendIdx: 0, gainDb: -60 });
     post({ type: 'set-track-mute', trackId: laneT('Drums'), mute: true });
     post({ type: 'set-track-mute', trackId: laneT('Bass'), mute: true });
     await sleep(250);
-    await parkedPlay(0.1);
+    await parkedPlay(3.0);
     await sleep(150);
     const before = bandEnergyDb(329.63).at;
     post({ type: 'set-track-volume', trackId: laneT('Keys'), gain: dbToLin(-20) });  // LINEAR contract
