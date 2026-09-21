@@ -1355,7 +1355,7 @@ setInterval(() => { if (state.playing && document.querySelector('#tab-analysis.p
 async function toggleTransport() {
   if (!built) { toast('build the arrangement first'); return; }
   if (state.playing) post({ type: 'transport-stop' });
-  else post({ type: 'transport-play' });
+  else { post({ type: 'transport-play' }); state.everPlayed = true; }
 }
 $('btn-play').addEventListener('click', toggleTransport);
 $('btn-stop').addEventListener('click', () => post({ type: 'transport-stop' }));
@@ -1414,6 +1414,7 @@ async function parkedPlay(fromSec) {
   post({ type: 'seek', seconds: fromSec });
   await sleep(200);
   post({ type: 'transport-play' });
+  state.everPlayed = true;   // the suite's warmup gate (the E1 first-play lesson)
   await sleep(600);
 }
 async function stopTransport() { post({ type: 'transport-stop' }); await sleep(350); }
@@ -1853,6 +1854,15 @@ function renderVerifyTable() {
 }
 async function runVerify(idOrAll) {
   const ids = idOrAll === 'all' ? VF_META.map((v) => v[0]) : [idOrAll];
+  // SUITE WARMUP: the FIRST transport play of a fresh build absorbs the
+  // sfizz freewheeling load in its opening blocks (the E1 lesson, proven
+  // again on the public deployment: un-warmed V2 read -54.9 vs -40.1;
+  // V4's -20 dB duck was masked by the ramp — ratio 0.418 vs 0.069).
+  if (!state.everPlayed) {
+    await parkedPlay(0.1);
+    await sleep(1600);
+    await stopTransport();
+  }
   for (const id of ids) {
     const row = $('vf-' + id.toLowerCase());
     if (row) row.querySelector('.vf-result').textContent = '…';
