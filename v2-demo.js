@@ -1832,11 +1832,28 @@ const VERIFY = {
     post({ type: 'enable-live-input' });
     const nt = await ask('num-tracks', null, 'track-count', 4000);
     const wc = await ask('num-wave-clips', { trackId: DRUMS() }, 'num-wave-clips', 4000, (m) => m.trackId === DRUMS());
-    await parkedPlay(0.1);
-    await sleep(900);
-    const band = bandEnergyDb(164.81);
+    await parkedPlay(0.1);            // WARMUP: the post-reload module's FIRST play absorbs the sfizz ramp (§6r.10)
     await stopTransport();
-    const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB · post-reload FX: IR ${irRestored} · Keys EQ ${eqRestored}`;
+    await sleep(250);
+    await parkedPlay(0.1);            // the measured play
+    // POSITION-GATED READ (the 2026-09-23 flake fix): the post-reload play's
+    // START LATENCY varies ~0-900ms with machine speed — a wall-clock read
+    // races the E2 root's note end (transport 0→1.5s): slow machines read
+    // mid-note, FAST machines read past the end into silence (the reported
+    // -116.9 dB floor flake — the old wall+1.5s read only ever passed
+    // BECAUSE of start latency). Gate on the transport POSITION instead:
+    // read mid-note (0.45-1.35s), immune to latency in either direction.
+    let band = null, posAtRead = state.position, tGated = 0;
+    while (tGated < 4000) {
+      const p = state.position;
+      posAtRead = p;
+      if (p >= 0.45 && p <= 1.35) { band = bandEnergyDb(164.81); break; }
+      if (p > 1.35) break;                     // past the window — read anyway, fail honestly
+      await sleep(100); tGated += 100;
+    }
+    if (!band) band = bandEnergyDb(164.81);
+    await stopTransport();
+    const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB @pos ${posAtRead.toFixed(2)}s · post-reload FX: IR ${irRestored} · Keys EQ ${eqRestored}`;
     const ok = hasSfizz && hasWave && nt && nt.numTracks === expectTracks && wc && wc.num === EXPECT.waveClipsT0
       && !String(irRestored).startsWith('FAILED') && !String(eqRestored).startsWith('FAILED')   // R1b F3: a failed mitigation = a failed round-trip
       && lk && lk.numRegions === EXPECT.epRegions && lb && lb.numRegions === EXPECT.bassRegions
@@ -1895,6 +1912,10 @@ function renderVerifyTable() {
 }
 async function runVerify(idOrAll) {
   const ids = idOrAll === 'all' ? VF_META.map((v) => v[0]) : [idOrAll];
+  if (!built) {   // hardening: a suite (or row) run before the build completes measures a half-built arrangement
+    for (const id of ids) state.verifyResults[id] = { pass: false, measured: 'arrangement not built — run Build first' };
+    return;
+  }
   // SUITE WARMUP: the FIRST transport play of a fresh build absorbs the
   // sfizz freewheeling load in its opening blocks (the E1 lesson, proven
   // again on the public deployment: un-warmed V2 read -54.9 vs -40.1;
