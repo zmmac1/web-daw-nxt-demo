@@ -1796,9 +1796,23 @@ const VERIFY = {
     // finding): the XML round-trip DROPS the bus's auxreturn+impulseResponse
     // plugins and the Keys 4bandEq (the loader restores [sfizz] but not the
     // FX chain — the serialized PLUGIN nodes for bus FX and the EQ do not
-    // deserialize). Re-add + re-feed, then re-wire the live input (the
-    // reload also resets the worklet's routing target — the post-suite
-    // keyboard was DEAD without this).
+    // deserialize; the 2026-09-23 native gate refined this: the drop is
+    // BROWSER-path-scoped — the native fresh-instance load RESTORES the
+    // auxreturn). FIRST ensure the auxreturn (the E5 companion export): the
+    // send has nothing to collect into without it = the wet path stays dead
+    // even with the IR re-added. Tolerant of the stale wasm (no reply = the
+    // export absent — the chain stays [VP,LM], the IR re-add proceeds at
+    // the same E2a-filtered index 0, V13's own assertions still hold).
+    let retEnsured = 'present-or-stale';
+    try {
+      const er = await ask('ensure-aux-return', { trackId: state.bus.trackId, busNum: 0 }, 'aux-return-ensured', 3000, (m) => m.trackId === state.bus.trackId);
+      if (er && typeof er.rc === 'number') {
+        if (er.rc !== 0) throw new Error('ensure-aux-return rc=' + er.rc);
+        retEnsured = 'ensured';
+      } else {
+        retEnsured = 'absent (stale wasm)';
+      }
+    } catch (e) { retEnsured = 'FAILED:' + String(e && e.message || e); }
     const busNp = await ask('num-plugins', { trackId: state.bus.trackId }, 'plugin-count', 4000, (m) => m.trackId === state.bus.trackId);
     let irRestored = 'present';
     try {
@@ -1853,9 +1867,9 @@ const VERIFY = {
     }
     if (!band) band = bandEnergyDb(164.81);
     await stopTransport();
-    const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB @pos ${posAtRead.toFixed(2)}s · post-reload FX: IR ${irRestored} · Keys EQ ${eqRestored}`;
+    const m = `xml ${(xe.xml.length / 1024).toFixed(0)} kB (sfizz:${hasSfizz} wave:${hasWave}) · reload tracks ${nt && nt.numTracks}/${expectTracks} · waveClips ${wc && wc.num} · regions ${lk && lk.numRegions}/${lb && lb.numRegions} · E3 band ${band.at.toFixed(1)} dB @pos ${posAtRead.toFixed(2)}s · post-reload FX: ret ${retEnsured} · IR ${irRestored} · Keys EQ ${eqRestored}`;
     const ok = hasSfizz && hasWave && nt && nt.numTracks === expectTracks && wc && wc.num === EXPECT.waveClipsT0
-      && !String(irRestored).startsWith('FAILED') && !String(eqRestored).startsWith('FAILED')   // R1b F3: a failed mitigation = a failed round-trip
+      && !String(retEnsured).startsWith('FAILED') && !String(irRestored).startsWith('FAILED') && !String(eqRestored).startsWith('FAILED')   // a failed mitigation = a failed round-trip (stale-wasm absence is tolerated)
       && lk && lk.numRegions === EXPECT.epRegions && lb && lb.numRegions === EXPECT.bassRegions
       && (band.at - band.neighbor >= 6);
     return { pass: !!ok, measured: m };

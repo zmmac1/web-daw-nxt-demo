@@ -1243,6 +1243,25 @@ class Phase5Processor extends AudioWorkletProcessor {
           this.port.postMessage({ type: 'warn', message: 'add-aux-bus: engine exports missing (stale wasm? — E2b build required)' });
         }
         break;
+      case 'ensure-aux-return':
+        // E5: the idempotent return-ensure — the load-edit-xml re-apply
+        // companion (the 2026-09-21 finding: the browser reload drops the
+        // bus's auxreturn, and `auxreturn` is not E2a-addable while
+        // add-aux-bus only creates NEW bus tracks). rc: 0 = ensured
+        // (INCLUDING the already-present no-op — the demo's V13 re-apply
+        // calls this every load) / -1 no engine / -2 bad trackId, busNum
+        // outside [0,63], or the busNum claimed by ANOTHER track's return /
+        // -3 creation failed / -4 transport playing (PRE-PLAY — stop
+        // before re-applying post-reload).
+        if (this.mod && typeof this.mod._engine_ensure_aux_return === 'function') {
+          const trackId = msg.trackId | 0 || 0;
+          const busNum = msg.busNum | 0;
+          const rc = this.mod._engine_ensure_aux_return(trackId, busNum);
+          this.port.postMessage({ type: 'aux-return-ensured', trackId, busNum, rc });
+        } else {
+          this.port.postMessage({ type: 'warn', message: 'ensure-aux-return: engine exports missing (stale wasm? — E5 build required)' });
+        }
+        break;
       case 'set-aux-bus-name':
         if (this.mod && typeof this.mod._engine_set_aux_bus_name === 'function') {
           try {
