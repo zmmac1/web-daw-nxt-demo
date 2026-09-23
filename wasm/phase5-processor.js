@@ -423,8 +423,14 @@ class Phase5Processor extends AudioWorkletProcessor {
       if (this.mod) {
         try { this.mod._engine_transport_stop(); } catch (_) {}
         try { if (this.outPtr) this.mod._free(this.outPtr); } catch (_) {}
+        // D3 (R9 P1-1): the poll-events static buffer belongs to THIS
+        // module's heap — free + zero it beside outPtr, or the next
+        // poll writes 8 KB through a stale pointer into the old heap
+        // (silent corruption / OOB after a rebuild).
+        try { if (this._evPtr) this.mod._free(this._evPtr); } catch (_) {}
       }
       this.outPtr = 0;
+      this._evPtr = 0;
       this.mod = null;
       this.wasmReady = false;
       this.engineMode = false;
@@ -707,6 +713,43 @@ class Phase5Processor extends AudioWorkletProcessor {
       case 'get-output-level':
         if (this.mod && typeof this.mod._engine_get_output_level === 'function') {
           this.port.postMessage({ type: 'output-level', level: this.mod._engine_get_output_level() });
+        }
+        break;
+      case 'poll-events':
+        // D3 (E5): the pull-drain event surface — design
+        // docs/research/2026-09-24-d3-event-codec-design.md §5.2. The
+        // worklet owns the engine here, so the poll runs on THIS thread
+        // (the same-thread contract, §4.1). Static 8 KB buffer (covers
+        // the worst case ring fill for N<=80 flat tracks) + query+malloc
+        // fallback. The reply carries a COPY (postMessage clones — fine
+        // at the 30 Hz post cadence). The page MUST NOT also use the
+        // legacy direct meter asks while polling (the coexistence rule,
+        // R8 P1-4 — mutual peak-stealing on the read-and-clear clients).
+        if (this.mod && typeof this.mod._engine_poll_events === 'function') {
+          try {
+            const CAP = 8192;
+            if (!this._evPtr) this._evPtr = this.mod._malloc(CAP);
+            let n = this.mod._engine_poll_events(this._evPtr, CAP);
+            let ptr = this._evPtr, cap = CAP, temp = 0;
+            if (n === -1 || n === 0xFFFFFFFF) {
+              // CAP_TOO_SMALL (N >= 81 flat tracks): query, malloc, retry.
+              const need = this.mod._engine_poll_events(0, 0);
+              temp = this.mod._malloc(need);
+              n = this.mod._engine_poll_events(temp, need);
+              ptr = temp; cap = need;
+            }
+            if (n === -1 || n === 0xFFFFFFFF) {
+              this.port.postMessage({ type: 'poll-events-error', message: 'poll-events: query-allocated buffer still too small (producer outrunning the poll?)' });
+            } else {
+              const copy = new Uint8Array(this.mod.HEAPU8.subarray(ptr, ptr + n));
+              this.port.postMessage({ type: 'poll-events', bytes: copy.buffer, n, cap }, msg.wxfer ? [copy.buffer] : []);
+            }
+            if (temp) this.mod._free(temp);
+          } catch (e) {
+            this.port.postMessage({ type: 'poll-events-error', message: `poll-events threw: ${String(e)}` });
+          }
+        } else {
+          this.port.postMessage({ type: 'poll-events-error', message: 'poll-events: engine exports missing (stale wasm? — the E5-events build required)' });
         }
         break;
       case 'enable-live-input':

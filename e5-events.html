@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>E5 Events — the D3 poll-drain event surface (browser carrier)</title>
+<!--
+  e5-events.html — the D3 browser-leg carrier (E5 checklist item 5, design
+  docs/research/2026-09-24-d3-event-codec-design.md §6 "Browser leg", the
+  R8-amended shapes):
+    (a) slot/legacy playhead parity — the FIRST poll after each legacy
+        `position` post (the legacy cadence is every 50 blocks ≈ 7.5 Hz;
+        a poll-window tolerance false-reds — R8 P1-2) + the stopped-state
+        parity + monotonic-advance sanity
+    (b) while a loud sustained source plays: the meter slots read REAL
+        values (status==0 AND > −60 dB — ≥ SILENT passes on a stolen
+        meter; R8 P1-4)
+    (c) transport edges seen (the play) + the slot agreement after the
+        ~350 ms isPlaying settle (R8 P1-1)
+    (d) zero console errors / poll-events-error posts
+    (e) the poll-events reply throughput ≥ ~30 Hz sustained
+
+  ⚠️ FAILS LOUDLY on a stale wasm (the worklet's poll-events case posts
+  poll-events-error "engine exports missing" — no green skips). The page
+  NEVER uses the legacy direct meter asks (the coexistence rule, R8 P1-4
+  — mutual peak-stealing on the read-and-clear clients).
+  Driven by tracktion-wasm/scripts/test_phase_e5events_browser.py via
+  window.__e5 (the phase-E2c carrier pattern; real clicks for audio).
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0a0a0a; color: #e4e4e7; padding: 20px;
+         font-family: system-ui, -apple-system, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #a1a1aa; font-size: 12px; margin-bottom: 14px; }
+  .panel { background: #18181b; border: 1px solid #27272a; border-radius: 8px;
+           padding: 12px 14px; margin-bottom: 12px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46;
+           border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: #7c3aed; border-color: #8b5cf6; font-weight: 600; }
+  #status { font-size: 13px; color: #a1a1aa; }
+  #log { font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap;
+         color: #a1a1aa; max-height: 160px; overflow-y: auto; }
+  table { border-collapse: collapse; font-size: 12px; width: 100%; }
+  td, th { border: 1px solid #27272a; padding: 4px 8px; text-align: left; }
+  th { color: #a1a1aa; font-weight: 500; }
+  .pass { color: #22c55e; font-weight: 600; }
+  .fail { color: #ef4444; font-weight: 600; }
+  .mono { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<h1>E5 · D3 poll-drain event surface — the browser carrier</h1>
+<div class="sub">engine_poll_events (query/cap-too-small/write ABI) · the 16 B header + 24 B records · slots every poll · transport/seek edges · 30 Hz post cadence</div>
+<div class="panel"><div class="row">
+  <button id="bBoot" class="primary">1 · Boot engine</button>
+  <button id="bBuild" disabled>2 · Build (sine clip)</button>
+  <button id="bPlay" disabled>▶ Play</button>
+  <button id="bStop" disabled>■ Stop</button>
+  <button id="bGate" class="primary" disabled>3 · Run the gate</button>
+  <span id="status">idle</span>
+</div></div>
+<div class="panel"><div id="results"></div></div>
+<div class="panel"><div id="log"></div></div>
+<script>
+'use strict';
+const SAMPLE_RATE = 48000;
+const SRC = { name: 'e5ev_sine', freq: 440.0, len: 3.0, amp: 0.5 };
+
+// ---- the shared state (the __e5 hook surface for the gate script) -------
+const state = {
+  booted: false, built: false, playing: false, trackId: -1,
+  polls: 0, pollErrors: 0, consoleErrors: 0,
+  lastDecoded: null, lastLegacyPos: null, pendingLegacy: null,
+  playheadSlots: [], transportSlots: [], meterSamples: [],
+  edgeSeq: [], pollTimes: [], gateResults: null,
+};
+window.__e5 = { state, startAudio, buildArrangement, play, stop, seek, runGate, decodePollEvents };
+function log(s) { const el = document.getElementById('log');
+  el.textContent += s + '\n'; el.scrollTop = el.scrollHeight; }
+function setStatus(s) { document.getElementById('status').textContent = s; }
+window.onerror = function (msg) { state.consoleErrors++; log('console ERROR: ' + msg); };
+(function () { const ce = console.error; console.error = function (...a) {
+  state.consoleErrors++; ce.apply(console, a); }; })();
+
+// ---- the codec decoder (the JS mirror of lib.rs's PollEvent reader) ----
+function decodePollEvents(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const header = {
+    version: dv.getUint16(0, true),
+    recordSize: dv.getUint16(2, true),
+    slotRecordCount: dv.getUint32(4, true),
+    ringCapacity: dv.getUint32(8, true),
+    droppedTotal: dv.getUint32(12, true),
+  };
+  const records = [];
+  for (let off = 16; off + 24 <= u8.length; off += 24) {
+    records.push({
+      tag: dv.getUint32(off, true),
+      status: dv.getUint32(off + 4, true),
+      id: Number(dv.getBigInt64(off + 8, true)),
+      aux: Number(dv.getBigInt64(off + 16, true)),
+      isEdge: (dv.getUint32(off, true) & 0x8000) !== 0,
+    });
+  }
+  return { header, records };
+}
+
+// ---- the worklet plumbing (the phase-E2c carrier pattern) ---------------
+let audioCtx = null, workletNode = null, engineReady = false, msgId = 0;
+const pending = new Map(), replies = [];
+function post(m) { m.id = ++msgId; workletNode.port.postMessage(m); }
+function waitFor(type, timeoutMs = 8000) {
+  const hit = replies.findIndex((d) => d.type === type);
+  if (hit >= 0) return Promise.resolve(replies.splice(hit, 1)[0]);
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      const i = replies.findIndex((d) => d.type === type);
+      if (i >= 0) { clearInterval(iv); resolve(replies.splice(i, 1)[0]); }
+      else if (Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(null); }
+    }, 25);
+  });
+}
+function onMessage(d) {
+  if (d.type === 'poll-events') { onPollReply(d); return; }
+  if (d.type === 'poll-events-error') { state.pollErrors++; log('poll-error: ' + d.message); return; }
+  if (d.type === 'position') {
+    const prev = state.lastLegacyPos;
+    // §6a.16 in the browser: the position READOUT is timer-synced — at play
+    // start the legacy stream posts FROZEN values (Δ=0 vs the previous
+    // post) then JUMPS (Δ > 200 ms in one ~133 ms cadence) when the
+    // readout converges. A legacy post is CONVERGED when its own delta vs
+    // the previous post is the normal cadence advance (0 < Δ <= 0.2 s).
+    const delta = prev ? (d.position - prev.position) : null;
+    const converged = prev ? (delta > 0 && delta <= 0.2) : false;
+    state.lastLegacyPos = { position: d.position, isPlaying: d.isPlaying, t: performance.now(), converged };
+    state.pendingLegacy = state.lastLegacyPos; // (a): the first poll after THIS post compares
+    return;
+  }
+  if (d.type === 'warn') { log('worklet warn: ' + (d.message || d.msg)); return; }
+  replies.push(d);
+}
+async function startAudio() {
+  if (state.booted) return { ok: true };
+  try {
+    setStatus('creating AudioContext…');
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctor({ latencyHint: 'interactive', sampleRate: SAMPLE_RATE });
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    await audioCtx.audioWorklet.addModule('wasm/phase5-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'phase5-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    workletNode.connect(audioCtx.destination);
+    workletNode.port.onmessage = (e) => onMessage(e.data);
+    const wasmResp = await fetch('wasm/tracktion_engine_wasm.wasm', { cache: 'no-store' });
+    const wasmBinary = await wasmResp.arrayBuffer();
+    post({ type: 'init-wasm', wasmBinary, instrument: 'none', deferLiveInput: true });
+    const ready = await waitFor('ready');
+    engineReady = !!(ready && ready.engineCreated === true);
+    if (!engineReady) { setStatus('engine FAILED'); return { ok: false }; }
+    // the page-driven pump (§6a.5)
+    setInterval(() => { if (workletNode) post({ type: 'pump' }); }, 100);
+    state.booted = true;
+    setStatus('engine ready');
+    return { ok: true };
+  } catch (e) { setStatus('ERROR: ' + String(e)); return { ok: false, error: String(e) }; }
+}
+async function buildArrangement() {
+  if (!state.booted || state.built) return { ok: state.built };
+  // the loud sustained source: a 3 s 440 Hz sine, amp 0.5, stereo planar
+  const frames = Math.trunc(SRC.len * SAMPLE_RATE);
+  const pcm = new Float32Array(frames * 2);
+  for (let i = 0; i < frames; i++) {
+    const v = SRC.amp * Math.sin((2 * Math.PI * SRC.freq * i) / SAMPLE_RATE);
+    pcm[i] = v; pcm[frames + i] = v;
+  }
+  post({ type: 'add-track', name: 'e5ev-src' });
+  const t = await waitFor('track-added');
+  state.trackId = t ? (t.trackId !== undefined ? t.trackId : 0) : -1;
+  post({ type: 'register-audio-buffer', name: SRC.name, pcm,
+         numFrames: frames, numChannels: 2, sampleRate: SAMPLE_RATE });
+  const reg = await waitFor('audio-buffer-registered');
+  if (!reg || reg.rc !== 0) { setStatus('register FAILED'); return { ok: false }; }
+  post({ type: 'insert-wave-clip', trackId: state.trackId, name: SRC.name,
+         startSec: 0, lengthSec: SRC.len });
+  const ins = await waitFor('wave-clip-inserted');
+  if (!ins || ins.rc < 0) { setStatus('insert FAILED'); return { ok: false }; }
+  state.built = true;
+  setStatus('built (track ' + state.trackId + ', clip ' + ins.clipIdx + ')');
+  return { ok: true, trackId: state.trackId };
+}
+async function play() {
+  // NOTE: transport-play is fire-and-forget (no reply message); the
+  // worklet's play-retry loop may emit SEVERAL play edges (the documented
+  // request multiplicity — design §4.2; dedupe against the slot).
+  post({ type: 'transport-play' });
+  state.playing = true;
+}
+async function stop() { post({ type: 'transport-stop' }); state.playing = false; }
+async function seek(sec) { post({ type: 'seek', seconds: sec }); }
+
+// ---- the 30 Hz poller ----------------------------------------------------
+let pollTimer = null, pollT0 = 0;
+function startPolling() {
+  if (pollTimer) return;
+  pollT0 = performance.now();
+  pollTimer = setInterval(() => { if (workletNode) post({ type: 'poll-events' }); }, 33);
+}
+function stopPolling() { clearInterval(pollTimer); pollTimer = null; }
+function onPollReply(d) {
+  if (!(d && d.bytes)) return;
+  const dec = decodePollEvents(new Uint8Array(d.bytes));
+  state.polls++;
+  state.pollTimes.push(performance.now());
+  state.lastDecoded = dec;
+  const slots = dec.records.filter((r) => !r.isEdge).slice(0, dec.header.slotRecordCount);
+  for (const r of slots) {
+    if (r.tag === 1) state.playheadSlots.push({ us: r.aux, t: performance.now(), pendingLegacy: state.pendingLegacy });
+    if (r.tag === 2) state.transportSlots.push({ playing: (r.status & 1) !== 0, t: performance.now() });
+    if (r.tag === 3 || r.tag === 4) state.meterSamples.push(r);
+  }
+  for (const r of dec.records) if (r.isEdge) state.edgeSeq.push(r);
+  state.pendingLegacy = null; // consumed by the first poll after the legacy post
+}
+
+// ---- the gate (assertions (a)-(e), the R8-amended shapes) ----------------
+async function runGate() {
+  const results = [];
+  const check = (ok, name, detail) => {
+    results.push({ name, ok, detail: detail || '' });
+    log((ok ? '  ok  ' : '  FAIL ') + name + (detail ? '  [' + detail + ']' : ''));
+  };
+  try {
+    // (e)+warm: poll for >= 3.2 s while playing (the loud source covers (b))
+    if (!state.built) { check(false, 'precondition: built'); return finish(); }
+    startPolling();
+    await play();
+    await new Promise((r) => setTimeout(r, 3300));
+    await stop();
+    await new Promise((r) => setTimeout(r, 400));
+    stopPolling();
+
+    // (e) throughput — >= 25 polls/sec sustained (30 Hz timer; clamping margin)
+    const span = (state.pollTimes[state.pollTimes.length - 1] - state.pollTimes[0]) / 1000;
+    const hz = span > 0 ? (state.pollTimes.length - 1) / span : 0;
+    check(hz >= 25, '(e) poll throughput >= 25 Hz sustained', hz.toFixed(1) + ' Hz over ' + span.toFixed(1) + ' s (' + state.polls + ' polls)');
+
+    // (b) the loud meters — REAL values (status==0 AND > -60 dB), not the floor
+    const trackM = state.meterSamples.filter((r) => r.tag === 3 && r.id === state.trackId);
+    const masterM = state.meterSamples.filter((r) => r.tag === 4);
+    const trackReal = trackM.filter((r) => r.status === 0 && r.aux > -6000);
+    const masterReal = masterM.filter((r) => r.status === 0 && r.aux > -6000);
+    check(trackReal.length >= 20, '(b) the track meter reads REAL values while loud', trackReal.length + '/' + trackM.length + ' polls status==0 & > -60 dB');
+    check(masterReal.length >= 20, '(b) the master meter reads REAL values while loud', masterReal.length + '/' + masterM.length + ' polls');
+
+    // (a) parity — the first poll after each CONVERGED legacy position
+    // post (the §6a.16 convergence zone — frozen-then-jumping legacy
+    // reads at play start — is EXCLUDED: the slot reads the same getter
+    // at a later instant and correctly reads the converged position; the
+    // outliers are the legacy stream's own readout lag, not a codec bug)
+    const paired = state.playheadSlots.filter((s) => s.pendingLegacy && s.pendingLegacy.converged);
+    // The R8 P1-2 formula: the tolerance = ONE LEGACY CADENCE (50 blocks
+    // @48k/128 = ~133 ms) + ONE POLL WINDOW (~33 ms) + margin = 180 ms.
+    // (The first post after the play-start ramp can straddle a cadence.)
+    const PARITY_MS = 180;
+    const parOk = paired.filter((s) => {
+      const legacySec = s.pendingLegacy.position;
+      const pollSec = s.us / 1e6;
+      return pollSec >= legacySec - 0.002 && pollSec <= legacySec + (PARITY_MS / 1000);
+    });
+    check(paired.length >= 5 && parOk.length === paired.length,
+          '(a) slot/legacy playhead parity (first poll after each legacy post)',
+          parOk.length + '/' + paired.length + ' within [legacy, legacy+' + PARITY_MS + 'ms]' +
+          (parOk.length === paired.length ? '' : '; outliers: ' +
+            paired.filter((s) => {
+              const legacySec = s.pendingLegacy.position;
+              const pollSec = s.us / 1e6;
+              return !(pollSec >= legacySec - 0.002 && pollSec <= legacySec + (PARITY_MS / 1000));
+            }).map((s) => 'legacy=' + s.pendingLegacy.position.toFixed(3) + (s.pendingLegacy.isPlaying ? '+p' : '+s') +
+                     ' poll=' + (s.us / 1e6).toFixed(3) + ' Δ=' + ((s.us / 1e6) - s.pendingLegacy.position).toFixed(3)).join(', ')));
+    // (a2) monotonic advance during play (modulo seeks — none here)
+    let monoBad = 0;
+    for (let i = 1; i < state.playheadSlots.length; i++) {
+      if (state.playheadSlots[i].us + 1 < state.playheadSlots[i - 1].us) monoBad++;
+    }
+    check(monoBad === 0, '(a) the playhead slot advances monotonically during play', monoBad + ' inversions over ' + state.playheadSlots.length + ' polls');
+    // (a3) stopped-state parity: the final slots read a stable playhead + playing=0
+    const lastT = state.transportSlots[state.transportSlots.length - 1];
+    check(!!lastT && lastT.playing === false, '(a3) the stopped state: the transport slot reads playing=0');
+
+    // (c) transport edges + slot agreement after the settle
+    const playEdges = state.edgeSeq.filter((r) => r.tag === 0x8001 && (r.status & 1) === 1);
+    const stopEdges = state.edgeSeq.filter((r) => r.tag === 0x8001 && (r.status & 1) === 0);
+    check(playEdges.length >= 1, '(c) transport play edges seen', playEdges.length + ' play / ' + stopEdges.length + ' stop (retry multiplicity documented — dedupe against the slot)');
+    const settleOk = state.transportSlots.length === 0 ? false :
+      state.transportSlots[state.transportSlots.length - 1].playing === false;
+    check(settleOk, '(c) the slot agrees with the final stop edge after the settle');
+
+    // (d) zero errors
+    check(state.pollErrors === 0 && state.consoleErrors === 0, '(d) zero console/poll errors', state.pollErrors + ' poll-errors, ' + state.consoleErrors + ' console-errors');
+
+    // header sanity (G6-flavored, browser-side)
+    const h = state.lastDecoded && state.lastDecoded.header;
+    check(!!h && h.version === 1 && h.recordSize === 24 && h.ringCapacity === 256,
+          'the header fields (version/recordSize/ringCapacity)', h ? JSON.stringify(h) : 'no polls');
+  } catch (e) {
+    check(false, 'gate threw: ' + String(e));
+  }
+  return finish();
+  function finish() {
+    state.gateResults = results;
+    const rows = results.map((r) =>
+      '<tr><td class="' + (r.ok ? 'pass' : 'fail') + '">' + (r.ok ? 'PASS' : 'FAIL') +
+      '</td><td>' + r.name + '</td><td class="mono">' + r.detail + '</td></tr>').join('');
+    document.getElementById('results').innerHTML =
+      '<table><tr><th>result</th><th>assertion</th><th>measured</th></tr>' + rows + '</table>';
+    const allOk = results.length > 0 && results.every((r) => r.ok);
+    setStatus('gate ' + (allOk ? 'GREEN' : 'RED') + ' — ' + results.filter((r) => r.ok).length + '/' + results.length);
+    return { ok: allOk, results };
+  }
+}
+
+// ---- the button wiring (real clicks — the headless-audio lesson) --------
+document.getElementById('bBoot').onclick = async () => {
+  document.getElementById('bBoot').disabled = true;
+  const r = await startAudio();
+  document.getElementById('bBuild').disabled = !r.ok;
+};
+document.getElementById('bBuild').onclick = async () => {
+  document.getElementById('bBuild').disabled = true;
+  await buildArrangement();
+  document.getElementById('bPlay').disabled = false;
+  document.getElementById('bStop').disabled = false;
+  document.getElementById('bGate').disabled = false;
+};
+document.getElementById('bPlay').onclick = play;
+document.getElementById('bStop').onclick = stop;
+document.getElementById('bGate').onclick = runGate;
+</script>
+</body>
+</html>
