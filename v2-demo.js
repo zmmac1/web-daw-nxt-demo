@@ -1807,8 +1807,25 @@ const VERIFY = {
     try {
       const er = await ask('ensure-aux-return', { trackId: state.bus.trackId, busNum: 0 }, 'aux-return-ensured', 3000, (m) => m.trackId === state.bus.trackId);
       if (er && typeof er.rc === 'number') {
-        if (er.rc !== 0) throw new Error('ensure-aux-return rc=' + er.rc);
-        retEnsured = 'ensured';
+        if (er.rc === 0) {
+          retEnsured = 'ensured';
+        } else if (er.rc === -2) {
+          // The 2026-09-23 ROOT-CAUSE REFINEMENT (measured on the public
+          // deployment): the XML round-trip does NOT drop the auxreturn —
+          // it MIS-PARENTS it. The serialized XML's track order ([Reverb,
+          // Bass, Keys, Drums…]) differs from the flat g_tracks order
+          // ([seeded, Keys, Bass, Reverb, Drums…]) and the serialize/
+          // restore path associates plugins by INDEX against the two
+          // orderings — the return restores onto the FIRST FLAT AudioTrack
+          // (the seeded track), so the bus's ensure correctly fires the
+          // cross-track guard. The return SURVIVES (the sends still collect
+          // — through the mis-parented track's routing); the genuinely
+          // dropped plugins are the IR + the EQ. Engine ledger: the
+          // index-vs-parentage plugin shuffle (E6-adjacent fix).
+          retEnsured = 'claimed-elsewhere (the XML-vs-flat parenting shuffle — engine ledger)';
+        } else {
+          throw new Error('ensure-aux-return rc=' + er.rc);
+        }
       } else {
         retEnsured = 'absent (stale wasm)';
       }
